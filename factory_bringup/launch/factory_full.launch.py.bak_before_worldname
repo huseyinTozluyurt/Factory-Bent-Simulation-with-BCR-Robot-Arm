@@ -1,0 +1,65 @@
+"""
+Whole simulation in one launch (what T1 + T2 + T3 do in separate terminals):
+
+  1. Gazebo + dual bent + BCR arm + overhead camera bridge   (factory_with_bcr_arm.launch.py)
+  2. attacher; with order_file it spawns that order on bent 1 as soon as Gazebo is up and
+     then starts the vision pick and place                    (bcr_endpoint_object_attacher.launch.py)
+  3. cameras, detector and the pick-and-place controller, after vision_delay seconds
+                                                              (vision_pick_place.launch.py)
+  4. optional: the Product Order GUI for live orders / bent stop-start (order_gui:=true)
+
+Usually started by run_factory.sh, which first lets you choose the products:
+  ros2 launch factory_bringup factory_full.launch.py order_file:=$HOME/.ros/factory_order.json
+Without order_file (none) the world's own products ride the bent and the arm starts at once.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, TimerAction
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    order_file = LaunchConfiguration("order_file")
+    launch_dir = PathJoinSubstitution([FindPackageShare("factory_bringup"), "launch"])
+
+    def include(name, args):
+        return IncludeLaunchDescription(PythonLaunchDescriptionSource(PathJoinSubstitution([launch_dir, name])),
+                                        launch_arguments=args.items())
+
+    gazebo = include("factory_with_bcr_arm.launch.py",
+                     {"factory_world_path": LaunchConfiguration("factory_world_path")})
+    attacher = include("bcr_endpoint_object_attacher.launch.py",
+                       {"startup_order_file": order_file, "start_vision_after_order": "true"})
+    # with an order the attacher starts the controller once the products are on the bent
+    vision = include("vision_pick_place.launch.py", {
+        "auto_start": PythonExpression(["'true' if '", order_file, "' in ('', 'none') else 'false'"]),
+        "show_window": LaunchConfiguration("show_window"),
+        "wait_at": LaunchConfiguration("wait_at"),
+        "motion_type": LaunchConfiguration("motion_type"),
+    })
+    gui = ExecuteProcess(cmd=["ros2", "run", "factory_bringup", "order_gui"], output="screen",
+                         condition=IfCondition(LaunchConfiguration("order_gui")))
+
+    return LaunchDescription([
+        DeclareLaunchArgument("order_file", default_value="none",
+                              description="JSON order from the GUI's selection mode; none = the world's products"),
+        DeclareLaunchArgument("factory_world_path",
+                              default_value=PathJoinSubstitution([
+                                  EnvironmentVariable("HOME"), "ros2_ws/src/factory_bent_project/my_factory_worlds/worlds",
+                                  "dual_circular_factory_conveyor.sdf"]),
+                              description="Absolute path to the dual circular factory conveyor SDF world"),
+        DeclareLaunchArgument("vision_delay", default_value="8.0",
+                              description="Seconds after Gazebo before cameras / controller start"),
+        DeclareLaunchArgument("show_window", default_value="true"),
+        DeclareLaunchArgument("wait_at", default_value="home"),
+        DeclareLaunchArgument("motion_type", default_value="auto"),
+        DeclareLaunchArgument("order_gui", default_value="true",
+                              description="Also open the Product Order GUI for live orders and bent stop / start"),
+        gazebo,
+        attacher,
+        TimerAction(period=LaunchConfiguration("vision_delay"), actions=[vision]),
+        TimerAction(period=LaunchConfiguration("vision_delay"), actions=[gui]),
+    ])

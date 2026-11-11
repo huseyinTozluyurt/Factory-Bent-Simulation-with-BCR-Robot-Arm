@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+Ring Object Detector - OpenCV detection for the dual circular factory bent.
+
+Pipeline on /overhead_camera/image:
+  grayscale -> Gaussian blur -> (intensity threshold OR filled Canny edges)
+  -> morphology -> contours inside each ring's belt annulus
+  -> minAreaRect -> pixel-to-world on the object top plane.
+
+Publishes:
+  /vision/ring1_objects   geometry_msgs/PoseArray (frame "world")
+  /vision/ring2_objects   geometry_msgs/PoseArray (frame "world")
+  /vision/detections      std_msgs/String (JSON with ring, x, y, yaw, size, area)
+  /vision/debug_image     sensor_msgs/Image (annotated bgr8)
+"""
+
+import json
+import math
+
+import rclpy
+from rclpy.node import Node
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose, PoseArray
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+from factory_bringup.vision_geometry import DetectorParams, OverheadCamera, Ring, RingObjectDetector
+
+
+class RingObjectDetectorNode(Node):
+    def __init__(self):
+        super().__init__("ring_object_detector")
+
+        self.declare_parameter("image_topic", "/overhead_camera/image")
+        self.declare_parameter("publish_debug_image", True)
+
+        # Must match <model name="overhead_camera"> in the world file.
+        self.declare_parameter("camera_x", 0.0)
+        self.declare_parameter("camera_y", 0.0)
+        self.declare_parameter("camera_z", 13.0)
+        self.declare_parameter("camera_roll", 0.0)
+        self.declare_parameter("camera_pitch", 1.5708)
+        self.declare_parameter("camera_yaw", 0.0)
+        self.declare_parameter("camera_hfov", 1.55)
+
+        # Ring 1 = left bent (pick), ring 2 = right bent (place).
+        self.declare_parameter("ring1_name", "ring1")
+        self.declare_parameter("ring1_center_x", -6.0)
+        self.declare_parameter("ring1_center_y", 0.0)
+        self.declare_parameter("ring2_name", "ring2")
+        self.declare_parameter("ring2_center_x", 6.0)
+        self.declare_parameter("ring2_center_y", 0.0)
+        self.declare_parameter("ring_inner_radius", 3.0)
+        self.declare_parameter("ring_outer_radius", 4.0)
+
+        defaults = DetectorParams()
+        for key, value in vars(defaults).items():
+            self.declare_parameter(key, value)
+
+        self.bridge = CvBridge()
+        self.detector = None
+        self.detector_size = None
+
+        self.ring1_pub = self.create_publisher(PoseArray, "/vision/ring1_objects", 10)
+        self.ring2_pub = self.create_publisher(PoseArray, "/vision/ring2_objects", 10)
+        self.json_pub = self.create_publisher(String, "/vision/detections", 10)
+        self.debug_pub = self.create_publisher(Image, "/vision/debug_image", 2)
+
+        self.create_subscription(Image, self.get_parameter("image_topic").value, self.image_callback, 2)
+        self.frame_count = 0
+        self.get_logger().info("Ring object detector ready, waiting for images.")
+
+    def p(self, name):
+        return self.get_parameter(name).value
+
+    def build_detector(self, width: int, height: int):
+        camera = OverheadCamera(
+            x=float(self.p("camera_x")), y=float(self.p("camera_y")), z=float(self.p("camera_z")),
+            roll=float(self.p("camera_roll")), pitch=float(self.p("camera_pitch")), yaw=float(self.p("camera_yaw")),
+            hfov=float(self.p("camera_hfov")), width=width, height=height,
+        )
+        rin, rout = float(self.p("ring_inner_radius")), float(self.p("ring_outer_radius"))
+        rings = [
+            Ring(self.p("ring1_name"), float(self.p("ring1_center_x")), float(self.p("ring1_center_y")), rin, rout),
+            Ring(self.p("ring2_name"), float(self.p("ring2_center_x")), float(self.p("ring2_center_y")), rin, rout),
+        ]
+        params = DetectorParams(**{k: type(v)(self.p(k)) for k, v in vars(DetectorParams()).items()})
+        self.detector = RingObjectDetector(camera, rings, params)
+        self.detector_size = (width, height)
+        self.get_logger().info(
+            f"Detector built for {width}x{height}, fx={camera.fx:.1f}px, rings at "
+            f"({rings[0].center_x}, {rings[0].center_y}) and ({rings[1].center_x}, {rings[1].center_y})."
+        )
+
+    def image_callback(self, msg: Image):
+        try:
+            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as exc:
+            self.get_logger().warn(f"cv_bridge conversion failed: {exc}")
+            return
+
+        h, w = bgr.shape[:2]
+        if self.detector is None or self.detector_size != (w, h):
+            self.build_detector(w, h)
+
+        detections, _ = self.detector.detect(bgr)
+        ring1_name = self.p("ring1_name")
+
+        arrays = {ring1_name: PoseArray(), self.p("ring2_name"): PoseArray()}
+        for arr in arrays.values():
+            arr.header.stamp = msg.header.stamp
+            arr.header.frame_id = "world"
+        for d in detections:
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = d.x, d.y, self.detector.params.object_top_z
+            pose.orientation.z, pose.orientation.w = math.sin(d.yaw / 2), math.cos(d.yaw / 2)
+            arrays[d.ring].poses.append(pose)
+
+        self.ring1_pub.publish(arrays[ring1_name])
+        self.ring2_pub.publish(arrays[self.p("ring2_name")])
+        self.json_pub.publish(String(data=json.dumps([d.as_dict() for d in detections])))
+
+        if self.p("publish_debug_image"):
+            dbg = self.detector.draw(bgr, detections)
+            out = self.bridge.cv2_to_imgmsg(dbg, encoding="bgr8")
+            out.header = msg.header
+            self.debug_pub.publish(out)
+
+        self.frame_count += 1
+        if self.frame_count % 50 == 1:
+            n1 = len(arrays[ring1_name].poses)
+            self.get_logger().info(f"frame {self.frame_count}: ring1={n1} objects, ring2={len(detections) - n1} objects")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RingObjectDetectorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

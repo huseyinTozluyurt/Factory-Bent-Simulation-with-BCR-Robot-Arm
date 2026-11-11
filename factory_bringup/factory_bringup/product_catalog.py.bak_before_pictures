@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+Product types that can ride the bents, and helpers to spawn an ordered row of them
+(no ROS imports; used by the attacher and the Product Order GUI).
+
+A spawned product is named  order_<type>_<number>,  e.g. order_paint_can_3, so its type
+(size, colour, shape) can always be looked up from the name.
+"""
+
+import math
+import re
+from typing import Dict, List, Optional, Tuple
+
+# type: size (x, y, z) in m (cylinder: diameter, diameter, height), RGB 0..1, shape, label
+PRODUCT_TYPES: Dict[str, Dict] = {
+    # the products of dual_circular_factory_conveyor.sdf
+    "shipping_box_large": {"size": (0.34, 0.26, 0.26), "rgb": (0.45, 0.29, 0.13), "shape": "box", "label": "Shipping box (large)"},
+    "milk_carton":        {"size": (0.16, 0.10, 0.34), "rgb": (0.97, 0.97, 0.98), "shape": "box", "label": "Milk carton"},
+    "bottle_boxy":        {"size": (0.12, 0.12, 0.42), "rgb": (0.25, 0.60, 0.95), "shape": "box", "label": "Bottle (boxy)"},
+    "sneaker_pair":       {"size": (0.36, 0.20, 0.12), "rgb": (0.12, 0.12, 0.15), "shape": "box", "label": "Sneaker pair"},
+    "packet_pouch":       {"size": (0.18, 0.06, 0.24), "rgb": (0.88, 0.80, 0.15), "shape": "box", "label": "Packet pouch"},
+    "shoe_box":           {"size": (0.34, 0.20, 0.14), "rgb": (0.14, 0.20, 0.45), "shape": "box", "label": "Shoe box"},
+    "long_package":       {"size": (0.48, 0.18, 0.18), "rgb": (0.72, 0.20, 0.20), "shape": "box", "label": "Long package"},
+    "pickup_box":         {"size": (0.34, 0.26, 0.26), "rgb": (0.90, 0.25, 0.10), "shape": "box", "label": "Pickup box"},
+    # new types
+    "cereal_box":         {"size": (0.20, 0.08, 0.30), "rgb": (0.95, 0.55, 0.10), "shape": "box", "label": "Cereal box"},
+    "detergent_bottle":   {"size": (0.14, 0.10, 0.30), "rgb": (0.10, 0.70, 0.60), "shape": "box", "label": "Detergent bottle"},
+    "soda_six_pack":      {"size": (0.24, 0.16, 0.13), "rgb": (0.85, 0.10, 0.15), "shape": "box", "label": "Soda six-pack"},
+    "book_parcel":        {"size": (0.30, 0.22, 0.08), "rgb": (0.85, 0.75, 0.55), "shape": "box", "label": "Book parcel"},
+    "toy_box":            {"size": (0.26, 0.26, 0.20), "rgb": (0.55, 0.30, 0.80), "shape": "box", "label": "Toy box"},
+    "paint_can":          {"size": (0.17, 0.17, 0.19), "rgb": (0.75, 0.75, 0.78), "shape": "cylinder", "label": "Paint can"},
+    "glass_jar":          {"size": (0.11, 0.11, 0.16), "rgb": (0.60, 0.85, 0.95), "shape": "cylinder", "label": "Glass jar"},
+    "poster_tube":        {"size": (0.10, 0.10, 0.40), "rgb": (0.95, 0.85, 0.35), "shape": "cylinder", "label": "Poster tube (standing)"},
+}
+
+ORDER_PREFIX = "order_"
+
+
+def type_of(model_name: Optional[str]) -> Optional[str]:
+    """Product type of a model name: order_<type>_<n>, product_<type>, or a world name like pickup_box."""
+    if not model_name:
+        return None
+    m = re.fullmatch(rf"{ORDER_PREFIX}(.+)_(\d+)", model_name)
+    if m and m.group(1) in PRODUCT_TYPES:
+        return m.group(1)
+    if model_name.startswith("product_") and model_name[len("product_"):] in PRODUCT_TYPES:
+        return model_name[len("product_"):]
+    return model_name if model_name in PRODUCT_TYPES else None
+
+
+def geometry_xml(shape: str, size: Tuple[float, float, float]) -> str:
+    sx, sy, sz = size
+    if shape == "cylinder":
+        return f"<cylinder><radius>{sx / 2.0}</radius><length>{sz}</length></cylinder>"
+    return f"<box><size>{sx} {sy} {sz}</size></box>"
+
+
+def product_sdf(name: str, ptype: str, twist: Optional[Tuple[float, float]] = None, gravity: bool = False,
+                mass: float = 0.2) -> str:
+    """SDF of one product model; with twist it orbits like the world's products (VelocityControl)."""
+    t = PRODUCT_TYPES[ptype]
+    r, g, b = t["rgb"]
+    geom = geometry_xml(t["shape"], t["size"])
+    plugin = ""
+    if twist is not None:
+        plugin = (f'<plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">'
+                  f'<initial_linear>{twist[0]} 0 0</initial_linear><initial_angular>0 0 {twist[1]}</initial_angular></plugin>')
+    return (f'<?xml version="1.0" ?><sdf version="1.8"><model name="{name}"><static>false</static>{plugin}'
+            f'<link name="link"><gravity>{"true" if gravity else "false"}</gravity>'
+            f'<velocity_decay><linear>0</linear><angular>0</angular></velocity_decay>'
+            f'<inertial><mass>{mass}</mass><inertia><ixx>0.001</ixx><iyy>0.001</iyy><izz>0.001</izz></inertia></inertial>'
+            f'<collision name="collision"><geometry>{geom}</geometry></collision>'
+            f'<visual name="visual"><geometry>{geom}</geometry><material><ambient>{r} {g} {b} 1</ambient>'
+            f'<diffuse>{r} {g} {b} 1</diffuse></material></visual></link></model></sdf>')
+
+
+def max_items(spacing: float, start_offset: float, radius: float) -> int:
+    """How many products fit on the ring at this spacing (keeps one spacing free before the first)."""
+    circ = 2 * math.pi * radius
+    return max(0, int((circ - start_offset - spacing) // spacing) + 1) if spacing > 0 else 0
+
+
+def order_poses(n: int, spacing: float, start_offset: float, center: Tuple[float, float], radius: float,
+                ref_angle: float = 0.0, ccw: bool = True) -> List[Tuple[float, float, float]]:
+    """
+    (x, y, yaw) for n products on a ring, equal arc distance `spacing` apart. Item 0 is
+    `start_offset` m before ref_angle (the catch station) against the travel direction,
+    so it arrives first; item 1 is `spacing` behind it, and so on.
+    """
+    out = []
+    sign = 1.0 if ccw else -1.0
+    for i in range(n):
+        a = ref_angle - sign * (start_offset + i * spacing) / radius
+        x, y = center[0] + radius * math.cos(a), center[1] + radius * math.sin(a)
+        out.append((x, y, a + sign * math.pi / 2))      # heading along the travel direction
+    return out

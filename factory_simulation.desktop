@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Factory Simulation
+Comment=Choose the products, then start Gazebo, the bents and the BCR arm pick and place
+Exec=bash -c "@PROJECT@/run_factory.sh; read -r -p 'Press Enter to close'"
+Icon=applications-engineering
+Terminal=true
+Categories=Development;Science;

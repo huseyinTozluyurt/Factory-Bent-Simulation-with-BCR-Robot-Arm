@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""
+BCR Arm Factory GUI - V10 Pick Zone + Precise Place
+
+Purpose:
+  GUI control for the BCR arm + real gripper + V4 fake gripper.
+
+Works with:
+  - /joint_trajectory_controller/joint_trajectory
+  - /gripper_position_controller/commands
+  - /pick_object
+  - /place_object
+  - /bcr_fake_gripper/set_parameters
+
+Recommended fake gripper backend:
+  bcr_fake_gripper.py V4 Stable Hold + Debug Version
+
+Main GUI workflow:
+  1. Move arm near object.
+  2. Click APPLY STABLE HOLD.
+  4. Click HYBRID PICK.
+  4. Move arm to place location.
+  5. Enable exact_place_on_release when precise placing is needed.
+  6. Click HYBRID PLACE. V9 calls /place_object first, then opens the real gripper.
+"""
+
+import sys
+import time
+from typing import Dict, List, Optional
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Float64MultiArray
+from std_srvs.srv import Trigger
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QDoubleSpinBox,
+    QLineEdit,
+    QTextEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QGroupBox,
+    QTabWidget,
+    QSlider,
+    QCheckBox,
+)
+
+DEFAULT_CONTROLLER_TOPIC = "/joint_trajectory_controller/joint_trajectory"
+DEFAULT_GRIPPER_TOPIC = "/gripper_position_controller/commands"
+DEFAULT_JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
+
+GRIPPER_OPEN = [0.04, 0.04]
+GRIPPER_CLOSE = [0.0, 0.0]
+
+STABLE_HOLD = {
+    "debug_mode": True,
+    "snap_on_pick": True,
+    "preserve_relative_pose": False,
+    "exact_place_on_release": False,
+    "max_pick_distance": 0.0,
+    "hold_offset_x": -0.12,
+    "hold_offset_y": 0.0,
+    "hold_offset_z": -0.08,
+    "hold_rpy_roll": 0.0,
+    "hold_rpy_pitch": 0.0,
+    "hold_rpy_yaw": 0.0,
+    "flat_object_orientation": False,
+    "verbose_debug": True,
+    "auto_move_object_to_pick_zone": False,
+    "use_pick_zone_for_distance": False,
+    "pick_zone_max_distance": 0.35,
+    "pick_x": 0.57,
+    "pick_y": 0.0,
+    "pick_z": 3.70,
+    "pick_qx": 0.0,
+    "pick_qy": 0.0,
+    "pick_qz": 0.0,
+    "pick_qw": 1.0,
+}
+
+PRESETS = {
+    "Home / Zero": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "Safe Observation": [0.0, 0.45, 0.0, -0.65, 0.0, 0.35, 0.0],
+    "Demo Pick Approach": [0.25, 0.65, 0.0, -0.95, 0.0, 0.55, 0.0],
+    "Demo Lift": [0.25, 0.35, 0.0, -0.55, 0.0, 0.35, 0.0],
+    "Demo Place Side": [-0.45, 0.45, 0.0, -0.75, 0.0, 0.45, 0.0],
+}
+
+
+class BCRArmGuiNode(Node):
+    def __init__(self):
+        super().__init__("bcr_arm_factory_gui_node")
+
+        self.current_joint_positions: Dict[str, float] = {}
+        self.last_joint_state_time: Optional[float] = None
+
+        self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+
+        self.trajectory_topic = DEFAULT_CONTROLLER_TOPIC
+        self.trajectory_pub = self.create_publisher(JointTrajectory, self.trajectory_topic, 10)
+
+        self.gripper_topic = DEFAULT_GRIPPER_TOPIC
+        self.gripper_pub = self.create_publisher(Float64MultiArray, self.gripper_topic, 10)
+
+        self.pick_client = self.create_client(Trigger, "/pick_object")
+        self.place_client = self.create_client(Trigger, "/place_object")
+        self.move_pick_zone_client = self.create_client(Trigger, "/move_object_to_pick_zone")
+        self.param_client = self.create_client(SetParameters, "/bcr_fake_gripper/set_parameters")
+
+    def joint_state_callback(self, msg: JointState):
+        for name, pos in zip(msg.name, msg.position):
+            self.current_joint_positions[name] = float(pos)
+        self.last_joint_state_time = time.time()
+
+    def set_controller_topic(self, topic_name: str):
+        self.trajectory_topic = topic_name
+        self.trajectory_pub = self.create_publisher(JointTrajectory, topic_name, 10)
+        self.get_logger().info(f"Trajectory topic set to: {topic_name}")
+
+    def set_gripper_topic(self, topic_name: str):
+        self.gripper_topic = topic_name
+        self.gripper_pub = self.create_publisher(Float64MultiArray, topic_name, 10)
+        self.get_logger().info(f"Gripper topic set to: {topic_name}")
+
+    def send_trajectory(self, joint_names: List[str], positions: List[float], duration_sec: float):
+        if len(joint_names) != len(positions):
+            raise ValueError("joint_names and positions lengths do not match.")
+
+        msg = JointTrajectory()
+        msg.joint_names = list(joint_names)
+
+        point = JointTrajectoryPoint()
+        point.positions = [float(p) for p in positions]
+
+        whole = int(duration_sec)
+        frac = duration_sec - whole
+        point.time_from_start.sec = whole
+        point.time_from_start.nanosec = int(frac * 1e9)
+
+        msg.points.append(point)
+        self.trajectory_pub.publish(msg)
+
+    def send_path(self, joint_names: List[str], targets: List[List[float]], seconds_per_target: float):
+        msg = JointTrajectory()
+        msg.joint_names = list(joint_names)
+
+        t = 0.0
+        for target in targets:
+            t += seconds_per_target
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in target]
+            point.time_from_start.sec = int(t)
+            point.time_from_start.nanosec = int((t - int(t)) * 1e9)
+            msg.points.append(point)
+
+        self.trajectory_pub.publish(msg)
+
+    def send_real_gripper(self, values: List[float]):
+        msg = Float64MultiArray()
+        msg.data = [float(v) for v in values]
+        self.gripper_pub.publish(msg)
+
+    def set_fake_gripper_params_async(self, params: Dict[str, object]):
+        if not self.param_client.service_is_ready():
+            self.param_client.wait_for_service(timeout_sec=0.05)
+
+        if not self.param_client.service_is_ready():
+            raise RuntimeError("/bcr_fake_gripper/set_parameters is not available. Launch bcr_fake_gripper first.")
+
+        req = SetParameters.Request()
+        req.parameters = []
+
+        for name, value in params.items():
+            param = Parameter()
+            param.name = name
+            param.value = ParameterValue()
+
+            if isinstance(value, bool):
+                param.value.type = ParameterType.PARAMETER_BOOL
+                param.value.bool_value = bool(value)
+            elif isinstance(value, int) or isinstance(value, float):
+                param.value.type = ParameterType.PARAMETER_DOUBLE
+                param.value.double_value = float(value)
+            else:
+                param.value.type = ParameterType.PARAMETER_STRING
+                param.value.string_value = str(value)
+
+            req.parameters.append(param)
+
+        return self.param_client.call_async(req)
+
+    def pick_object_async(self):
+        if not self.pick_client.service_is_ready():
+            self.pick_client.wait_for_service(timeout_sec=0.05)
+
+        if not self.pick_client.service_is_ready():
+            raise RuntimeError("/pick_object is not available. Launch bcr_fake_gripper first.")
+
+        return self.pick_client.call_async(Trigger.Request())
+
+    def place_object_async(self):
+        if not self.place_client.service_is_ready():
+            self.place_client.wait_for_service(timeout_sec=0.05)
+
+        if not self.place_client.service_is_ready():
+            raise RuntimeError("/place_object is not available. Launch bcr_fake_gripper first.")
+
+        return self.place_client.call_async(Trigger.Request())
+
+    def move_object_to_pick_zone_async(self):
+        if not self.move_pick_zone_client.service_is_ready():
+            self.move_pick_zone_client.wait_for_service(timeout_sec=0.05)
+
+        if not self.move_pick_zone_client.service_is_ready():
+            raise RuntimeError("/move_object_to_pick_zone is not available. Launch bcr_fake_gripper V4.2 first.")
+
+        return self.move_pick_zone_client.call_async(Trigger.Request())
+
+
+class JointControlRow(QWidget):
+    def __init__(self, name: str, value: float, parent_ui):
+        super().__init__()
+        self.name = name
+        self.parent_ui = parent_ui
+
+        layout = QHBoxLayout()
+        self.setLayout(layout)
+
+        self.label = QLabel(name)
+        self.label.setFixedWidth(60)
+
+        self.minus_big = QPushButton("--")
+        self.minus_small = QPushButton("-")
+        self.plus_small = QPushButton("+")
+        self.plus_big = QPushButton("++")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(-3142, 3142)
+        self.slider.setValue(int(value * 1000))
+
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(-3.1416, 3.1416)
+        self.spin.setDecimals(3)
+        self.spin.setSingleStep(0.05)
+        self.spin.setValue(value)
+        self.spin.setFixedWidth(95)
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.minus_big)
+        layout.addWidget(self.minus_small)
+        layout.addWidget(self.slider)
+        layout.addWidget(self.spin)
+        layout.addWidget(self.plus_small)
+        layout.addWidget(self.plus_big)
+
+        self.slider.valueChanged.connect(self.on_slider_changed)
+        self.spin.valueChanged.connect(self.on_spin_changed)
+
+        self.minus_big.clicked.connect(lambda: self.add_delta(-0.25))
+        self.minus_small.clicked.connect(lambda: self.add_delta(-0.05))
+        self.plus_small.clicked.connect(lambda: self.add_delta(0.05))
+        self.plus_big.clicked.connect(lambda: self.add_delta(0.25))
+
+    def on_slider_changed(self, raw: int):
+        value = raw / 1000.0
+        if abs(self.spin.value() - value) > 0.001:
+            self.spin.blockSignals(True)
+            self.spin.setValue(value)
+            self.spin.blockSignals(False)
+
+    def on_spin_changed(self, value: float):
+        raw = int(value * 1000)
+        if self.slider.value() != raw:
+            self.slider.blockSignals(True)
+            self.slider.setValue(raw)
+            self.slider.blockSignals(False)
+
+    def add_delta(self, delta: float):
+        self.spin.setValue(self.spin.value() + delta)
+        if self.parent_ui.auto_send_checkbox.isChecked():
+            self.parent_ui.on_move_to_current()
+
+    def value(self) -> float:
+        return float(self.spin.value())
+
+    def set_value(self, value: float):
+        self.spin.setValue(float(value))
+
+
+class BCRArmFactoryGUI(QWidget):
+    def __init__(self, node: BCRArmGuiNode):
+        super().__init__()
+
+        self.node = node
+        self.selected_joint_names: List[str] = list(DEFAULT_JOINT_NAMES)
+        self.joint_rows: Dict[str, JointControlRow] = {}
+        self.saved_targets: List[List[float]] = []
+        self.auto_loaded_once = False
+        self.attached_state = False
+
+        self.setWindowTitle("BCR Arm Factory Controller V10 - Pick Zone + Precise Place")
+        self.setGeometry(80, 60, 1080, 840)
+
+        root = QVBoxLayout()
+        self.setLayout(root)
+
+        self.status_label = QLabel("Starting...")
+        root.addWidget(self.status_label)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+
+        self.build_control_tab()
+        self.build_pick_place_tab()
+        self.build_teach_tab()
+        self.build_settings_tab()
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(160)
+        root.addWidget(QLabel("Log"))
+        root.addWidget(self.log_box)
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.on_timer)
+        self.timer.start(30)
+
+        self.log("BCR Arm Factory GUI V10 started.")
+        self.log("Use APPLY STABLE HOLD before HYBRID PICK during development.")
+
+    def build_control_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        tab.setLayout(layout)
+
+        top = QHBoxLayout()
+        self.duration_spin = QDoubleSpinBox()
+        self.duration_spin.setRange(0.1, 20.0)
+        self.duration_spin.setValue(2.0)
+        self.duration_spin.setSingleStep(0.1)
+
+        self.auto_send_checkbox = QCheckBox("Auto-send after +/- click")
+        self.auto_send_checkbox.setChecked(False)
+
+        top.addWidget(QLabel("Move duration [sec]:"))
+        top.addWidget(self.duration_spin)
+        top.addWidget(self.auto_send_checkbox)
+        top.addStretch()
+        layout.addLayout(top)
+
+        self.joint_group = QGroupBox("Joint Controls")
+        self.joint_layout = QVBoxLayout()
+        self.joint_group.setLayout(self.joint_layout)
+        layout.addWidget(self.joint_group)
+
+        self.rebuild_joint_controls(DEFAULT_JOINT_NAMES)
+
+        buttons = QHBoxLayout()
+        self.move_btn = QPushButton("MOVE TO CURRENT")
+        self.move_btn.clicked.connect(self.on_move_to_current)
+
+        self.sync_btn = QPushButton("SYNC FROM /joint_states")
+        self.sync_btn.clicked.connect(self.on_sync_from_joint_states)
+
+        self.home_btn = QPushButton("HOME")
+        self.home_btn.clicked.connect(lambda: self.apply_preset("Home / Zero", send=True))
+
+        self.stop_btn = QPushButton("HOLD CURRENT")
+        self.stop_btn.clicked.connect(self.on_hold_current)
+
+        buttons.addWidget(self.move_btn)
+        buttons.addWidget(self.sync_btn)
+        buttons.addWidget(self.home_btn)
+        buttons.addWidget(self.stop_btn)
+        layout.addLayout(buttons)
+
+        preset_group = QGroupBox("Preset Poses")
+        preset_layout = QGridLayout()
+        preset_group.setLayout(preset_layout)
+
+        r, c = 0, 0
+        for name in PRESETS.keys():
+            btn = QPushButton(name)
+            btn.clicked.connect(lambda _, n=name: self.apply_preset(n, send=True))
+            preset_layout.addWidget(btn, r, c)
+            c += 1
+            if c >= 3:
+                c = 0
+                r += 1
+
+        layout.addWidget(preset_group)
+        self.tabs.addTab(tab, "Arm Control")
+
+    def build_pick_place_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        tab.setLayout(layout)
+
+        object_group = QGroupBox("Stable Hybrid Pick / Place")
+        object_layout = QVBoxLayout()
+        object_group.setLayout(object_layout)
+
+        row = QHBoxLayout()
+        self.object_name_edit = QLineEdit("pickup_box")
+        row.addWidget(QLabel("Gazebo model name:"))
+        row.addWidget(self.object_name_edit)
+        object_layout.addLayout(row)
+
+        real_row = QHBoxLayout()
+        self.open_real_btn = QPushButton("OPEN REAL GRIPPER")
+        self.open_real_btn.clicked.connect(self.on_open_real_gripper)
+        self.close_real_btn = QPushButton("CLOSE REAL GRIPPER")
+        self.close_real_btn.clicked.connect(self.on_close_real_gripper)
+        real_row.addWidget(self.open_real_btn)
+        real_row.addWidget(self.close_real_btn)
+        object_layout.addLayout(real_row)
+
+        mode_row = QHBoxLayout()
+        self.apply_stable_btn = QPushButton("APPLY STABLE HOLD")
+        self.apply_stable_btn.clicked.connect(self.on_apply_stable_hold)
+
+        self.dev_mode_btn = QPushButton("DEVELOPMENT MODE")
+        self.dev_mode_btn.clicked.connect(self.on_development_mode)
+
+        self.demo_mode_btn = QPushButton("DEMO MODE")
+        self.demo_mode_btn.clicked.connect(self.on_demo_mode)
+
+        mode_row.addWidget(self.apply_stable_btn)
+        mode_row.addWidget(self.dev_mode_btn)
+        mode_row.addWidget(self.demo_mode_btn)
+        object_layout.addLayout(mode_row)
+
+        fake_row = QHBoxLayout()
+        self.pick_btn = QPushButton("PICK / ATTACH ONLY")
+        self.pick_btn.clicked.connect(self.on_pick_object)
+
+        self.place_btn = QPushButton("PLACE / RELEASE ONLY")
+        self.place_btn.clicked.connect(self.on_place_object)
+
+        fake_row.addWidget(self.pick_btn)
+        fake_row.addWidget(self.place_btn)
+        object_layout.addLayout(fake_row)
+
+        hybrid_row = QHBoxLayout()
+        self.hybrid_pick_btn = QPushButton("HYBRID PICK")
+        self.hybrid_pick_btn.clicked.connect(self.on_hybrid_pick)
+
+        self.hybrid_place_btn = QPushButton("HYBRID PLACE / PRECISE RELEASE")
+        self.hybrid_place_btn.clicked.connect(self.on_hybrid_place)
+
+        hybrid_row.addWidget(self.hybrid_pick_btn)
+        hybrid_row.addWidget(self.hybrid_place_btn)
+        object_layout.addLayout(hybrid_row)
+
+        snap_group = QGroupBox("Stable Hold Parameters")
+        snap_layout = QGridLayout()
+        snap_group.setLayout(snap_layout)
+
+        self.debug_mode_checkbox = QCheckBox("debug_mode: ignore distance check")
+        self.debug_mode_checkbox.setChecked(True)
+
+        self.snap_pick_checkbox = QCheckBox("snap_on_pick")
+        self.snap_pick_checkbox.setChecked(True)
+
+        self.preserve_relative_checkbox = QCheckBox("preserve_relative_pose")
+        self.preserve_relative_checkbox.setChecked(False)
+
+        self.flat_orientation_checkbox = QCheckBox("flat_object_orientation")
+        self.flat_orientation_checkbox.setChecked(False)
+
+        self.max_pick_distance_spin = self.make_pose_spin(0.0, minimum=0.0, maximum=10.0, step=0.05)
+        self.hold_x_spin = self.make_pose_spin(-0.12)
+        self.hold_y_spin = self.make_pose_spin(0.0)
+        self.hold_z_spin = self.make_pose_spin(-0.08)
+
+        self.apply_custom_snap_btn = QPushButton("APPLY CUSTOM HOLD PARAMS")
+        self.apply_custom_snap_btn.clicked.connect(self.on_apply_custom_hold)
+
+        snap_layout.addWidget(self.debug_mode_checkbox, 0, 0, 1, 2)
+        snap_layout.addWidget(self.snap_pick_checkbox, 1, 0, 1, 2)
+        snap_layout.addWidget(self.preserve_relative_checkbox, 2, 0, 1, 2)
+        snap_layout.addWidget(self.flat_orientation_checkbox, 3, 0, 1, 2)
+
+        snap_layout.addWidget(QLabel("max_pick_distance:"), 4, 0)
+        snap_layout.addWidget(self.max_pick_distance_spin, 4, 1)
+
+        snap_layout.addWidget(QLabel("hold_offset_x:"), 5, 0)
+        snap_layout.addWidget(self.hold_x_spin, 5, 1)
+
+        snap_layout.addWidget(QLabel("hold_offset_y:"), 6, 0)
+        snap_layout.addWidget(self.hold_y_spin, 6, 1)
+
+        snap_layout.addWidget(QLabel("hold_offset_z:"), 7, 0)
+        snap_layout.addWidget(self.hold_z_spin, 7, 1)
+
+        snap_layout.addWidget(self.apply_custom_snap_btn, 8, 0, 1, 2)
+        object_layout.addWidget(snap_group)
+
+        pick_zone_group = QGroupBox("Pick Zone Target - Red Rectangle Location")
+        pick_zone_layout = QGridLayout()
+        pick_zone_group.setLayout(pick_zone_layout)
+
+        self.auto_move_pick_zone_checkbox = QCheckBox("auto_move_object_to_pick_zone before PICK")
+        self.auto_move_pick_zone_checkbox.setChecked(False)
+
+        self.use_pick_zone_distance_checkbox = QCheckBox("use_pick_zone_for_distance in DEMO MODE")
+        self.use_pick_zone_distance_checkbox.setChecked(False)
+
+        self.pick_zone_max_distance_spin = self.make_pose_spin(0.35, minimum=0.0, maximum=10.0, step=0.05)
+
+        self.pick_x_spin = self.make_pose_spin(0.57)
+        self.pick_y_spin = self.make_pose_spin(0.0)
+        self.pick_z_spin = self.make_pose_spin(3.70)
+
+        self.apply_pick_zone_btn = QPushButton("APPLY PICK ZONE SETTINGS")
+        self.apply_pick_zone_btn.clicked.connect(self.on_apply_pick_zone_settings)
+
+        self.move_pick_zone_btn = QPushButton("MOVE OBJECT TO PICK ZONE")
+        self.move_pick_zone_btn.clicked.connect(self.on_move_object_to_pick_zone)
+
+        pick_zone_layout.addWidget(self.auto_move_pick_zone_checkbox, 0, 0, 1, 2)
+        pick_zone_layout.addWidget(self.use_pick_zone_distance_checkbox, 1, 0, 1, 2)
+        pick_zone_layout.addWidget(QLabel("pick_zone_max_distance:"), 2, 0)
+        pick_zone_layout.addWidget(self.pick_zone_max_distance_spin, 2, 1)
+        pick_zone_layout.addWidget(QLabel("pick_x:"), 3, 0)
+        pick_zone_layout.addWidget(self.pick_x_spin, 3, 1)
+        pick_zone_layout.addWidget(QLabel("pick_y:"), 4, 0)
+        pick_zone_layout.addWidget(self.pick_y_spin, 4, 1)
+        pick_zone_layout.addWidget(QLabel("pick_z:"), 5, 0)
+        pick_zone_layout.addWidget(self.pick_z_spin, 5, 1)
+        pick_zone_layout.addWidget(self.apply_pick_zone_btn, 6, 0)
+        pick_zone_layout.addWidget(self.move_pick_zone_btn, 6, 1)
+
+        object_layout.addWidget(pick_zone_group)
+
+        place_group = QGroupBox("Exact Place Target")
+        place_layout = QGridLayout()
+        place_group.setLayout(place_layout)
+
+        self.exact_place_checkbox = QCheckBox("exact_place_on_release")
+        self.exact_place_checkbox.setChecked(True)
+
+        self.place_x_spin = self.make_pose_spin(0.57)
+        self.place_y_spin = self.make_pose_spin(0.0)
+        self.place_z_spin = self.make_pose_spin(3.70)
+
+        self.apply_place_btn = QPushButton("APPLY EXACT PLACE SETTINGS")
+        self.apply_place_btn.clicked.connect(self.on_apply_place_settings)
+
+        place_layout.addWidget(self.exact_place_checkbox, 0, 0, 1, 2)
+        place_layout.addWidget(QLabel("place_x:"), 1, 0)
+        place_layout.addWidget(self.place_x_spin, 1, 1)
+        place_layout.addWidget(QLabel("place_y:"), 2, 0)
+        place_layout.addWidget(self.place_y_spin, 2, 1)
+        place_layout.addWidget(QLabel("place_z:"), 3, 0)
+        place_layout.addWidget(self.place_z_spin, 3, 1)
+        place_layout.addWidget(self.apply_place_btn, 4, 0, 1, 2)
+        object_layout.addWidget(place_group)
+
+        self.gripper_status_label = QLabel("Hybrid gripper: unknown")
+        object_layout.addWidget(self.gripper_status_label)
+
+        layout.addWidget(object_group)
+
+        instructions = QLabel(
+            "Recommended workflow:\n"
+            "1. Move the arm near pickup_box.\n"
+            "2. Click APPLY STABLE HOLD.\n"
+            "3. Click HYBRID PICK: close real gripper + /pick_object.\n"
+            "4. Move the arm to the place location.\n"
+            "5. For precise placement, keep exact_place_on_release checked and set place_x/y/z."
+            "6. Click HYBRID PLACE: /place_object first, then real gripper opens.\n\n"
+            "Development mode uses debug_mode=True and max_pick_distance=0.0.\n"
+            "Demo mode uses debug_mode=False and max_pick_distance=0.5."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        layout.addStretch()
+
+        self.tabs.addTab(tab, "Pick / Place")
+
+    def make_pose_spin(self, value: float, minimum: float = -20.0, maximum: float = 20.0, step: float = 0.01) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(3)
+        spin.setSingleStep(step)
+        spin.setValue(value)
+        return spin
+
+    def build_teach_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        tab.setLayout(layout)
+
+        self.target_list = QListWidget()
+        layout.addWidget(self.target_list)
+
+        row = QHBoxLayout()
+        self.teach_btn = QPushButton("TEACH CURRENT TARGET")
+        self.teach_btn.clicked.connect(self.on_teach)
+
+        self.play_btn = QPushButton("PLAY TAUGHT PATH")
+        self.play_btn.clicked.connect(self.on_play_path)
+
+        self.clear_btn = QPushButton("CLEAR PATH")
+        self.clear_btn.clicked.connect(self.on_clear_path)
+
+        row.addWidget(self.teach_btn)
+        row.addWidget(self.play_btn)
+        row.addWidget(self.clear_btn)
+        layout.addLayout(row)
+
+        self.tabs.addTab(tab, "Teach Path")
+
+    def build_settings_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        tab.setLayout(layout)
+
+        topic_group = QGroupBox("ROS Topics / Joints")
+        topic_layout = QVBoxLayout()
+        topic_group.setLayout(topic_layout)
+
+        row = QHBoxLayout()
+        self.topic_edit = QLineEdit(DEFAULT_CONTROLLER_TOPIC)
+        self.topic_apply_btn = QPushButton("Apply Topic")
+        self.topic_apply_btn.clicked.connect(self.on_apply_topic)
+        row.addWidget(QLabel("Trajectory topic:"))
+        row.addWidget(self.topic_edit)
+        row.addWidget(self.topic_apply_btn)
+        topic_layout.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.joint_names_edit = QLineEdit(",".join(DEFAULT_JOINT_NAMES))
+        self.joint_names_apply_btn = QPushButton("Apply Joint Names")
+        self.joint_names_apply_btn.clicked.connect(self.on_apply_joint_names)
+        row2.addWidget(QLabel("Joint names:"))
+        row2.addWidget(self.joint_names_edit)
+        row2.addWidget(self.joint_names_apply_btn)
+        topic_layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        self.gripper_topic_edit = QLineEdit(DEFAULT_GRIPPER_TOPIC)
+        self.gripper_topic_apply_btn = QPushButton("Apply Gripper Topic")
+        self.gripper_topic_apply_btn.clicked.connect(self.on_apply_gripper_topic)
+        row3.addWidget(QLabel("Real gripper topic:"))
+        row3.addWidget(self.gripper_topic_edit)
+        row3.addWidget(self.gripper_topic_apply_btn)
+        topic_layout.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        self.load_joints_btn = QPushButton("Load from /joint_states")
+        self.load_joints_btn.clicked.connect(self.on_load_joints_from_joint_states)
+        self.default_joints_btn = QPushButton("Use BCR default joint1...joint7")
+        self.default_joints_btn.clicked.connect(lambda: self.apply_joint_names(DEFAULT_JOINT_NAMES))
+        row4.addWidget(self.load_joints_btn)
+        row4.addWidget(self.default_joints_btn)
+        topic_layout.addLayout(row4)
+
+        layout.addWidget(topic_group)
+        layout.addStretch()
+        self.tabs.addTab(tab, "Settings")
+
+    def rebuild_joint_controls(self, joint_names: List[str]):
+        while self.joint_layout.count():
+            item = self.joint_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.selected_joint_names = list(joint_names)
+        self.joint_rows = {}
+
+        for name in self.selected_joint_names:
+            value = self.node.current_joint_positions.get(name, 0.0)
+            row = JointControlRow(name, value, self)
+            self.joint_layout.addWidget(row)
+            self.joint_rows[name] = row
+
+    def on_timer(self):
+        rclpy.spin_once(self.node, timeout_sec=0.0)
+
+        if self.node.last_joint_state_time is not None:
+            age = time.time() - self.node.last_joint_state_time
+            joint_text = f"/joint_states OK, age {age:.2f}s"
+        else:
+            joint_text = "/joint_states NOT received"
+
+        pick_ready = self.node.pick_client.service_is_ready()
+        place_ready = self.node.place_client.service_is_ready()
+        param_ready = self.node.param_client.service_is_ready()
+        move_pick_ready = self.node.move_pick_zone_client.service_is_ready()
+
+        attached_text = "ATTACHED" if self.attached_state else "not attached"
+        service_text = f"fake_gripper: pick={pick_ready}, place={place_ready}, param={param_ready}, move_pick_zone={move_pick_ready}"
+
+        self.status_label.setText(f"{joint_text} | {service_text} | object: {attached_text}")
+        self.gripper_status_label.setText(f"{service_text} | object is {attached_text}")
+
+        if not self.auto_loaded_once and self.node.current_joint_positions:
+            names = list(self.node.current_joint_positions.keys())
+            if all(name in names for name in DEFAULT_JOINT_NAMES):
+                self.apply_joint_names(DEFAULT_JOINT_NAMES)
+                self.auto_loaded_once = True
+                self.log("Auto-loaded BCR joint names: joint1...joint7")
+
+    def log(self, text: str):
+        stamp = time.strftime("%H:%M:%S")
+        self.log_box.append(f"[{stamp}] {text}")
+
+    def current_positions_from_ui(self) -> List[float]:
+        return [self.joint_rows[name].value() for name in self.selected_joint_names]
+
+    def set_ui_positions(self, positions: List[float]):
+        for name, value in zip(self.selected_joint_names, positions):
+            if name in self.joint_rows:
+                self.joint_rows[name].set_value(value)
+
+    def on_move_to_current(self):
+        try:
+            missing = [n for n in self.selected_joint_names if n not in self.node.current_joint_positions]
+            if missing:
+                QMessageBox.warning(self, "Joint mismatch", "These joints are not in /joint_states:\n" + ", ".join(missing))
+                self.log(f"ERROR: Joint mismatch: {missing}")
+                return
+
+            positions = self.current_positions_from_ui()
+            duration = self.duration_spin.value()
+            self.node.send_trajectory(self.selected_joint_names, positions, duration)
+            self.log(f"Sent trajectory: {positions}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Move failed", str(exc))
+            self.log(f"ERROR: Move failed: {exc}")
+
+    def on_hold_current(self):
+        self.on_sync_from_joint_states()
+        self.on_move_to_current()
+        self.log("Hold current command sent.")
+
+    def on_sync_from_joint_states(self):
+        for name, row in self.joint_rows.items():
+            if name in self.node.current_joint_positions:
+                row.set_value(self.node.current_joint_positions[name])
+        self.log("Synced controls from /joint_states.")
+
+    def apply_preset(self, preset_name: str, send: bool = False):
+        positions = PRESETS[preset_name]
+        self.set_ui_positions(positions)
+        self.log(f"Loaded preset: {preset_name}")
+        if send:
+            self.on_move_to_current()
+
+    def on_apply_topic(self):
+        topic = self.topic_edit.text().strip()
+        if not topic.startswith("/"):
+            topic = "/" + topic
+            self.topic_edit.setText(topic)
+        self.node.set_controller_topic(topic)
+        self.log(f"Applied trajectory topic: {topic}")
+
+    def on_apply_gripper_topic(self):
+        topic = self.gripper_topic_edit.text().strip()
+        if not topic.startswith("/"):
+            topic = "/" + topic
+            self.gripper_topic_edit.setText(topic)
+        self.node.set_gripper_topic(topic)
+        self.log(f"Applied real gripper topic: {topic}")
+
+    def on_apply_joint_names(self):
+        raw = self.joint_names_edit.text().strip()
+        names = [x.strip() for x in raw.split(",") if x.strip()]
+        if not names:
+            QMessageBox.warning(self, "Invalid joint names", "Please enter at least one joint name.")
+            return
+        self.apply_joint_names(names)
+
+    def apply_joint_names(self, names: List[str]):
+        self.joint_names_edit.setText(",".join(names))
+        self.rebuild_joint_controls(names)
+        self.log(f"Applied joint names: {names}")
+
+    def on_load_joints_from_joint_states(self):
+        names = list(self.node.current_joint_positions.keys())
+        if not names:
+            QMessageBox.warning(self, "No joint states", "No /joint_states received yet.")
+            return
+
+        if all(name in names for name in DEFAULT_JOINT_NAMES):
+            names = DEFAULT_JOINT_NAMES
+
+        self.apply_joint_names(names)
+
+    def on_open_real_gripper(self):
+        self.node.send_real_gripper(GRIPPER_OPEN)
+        self.log("OPEN REAL GRIPPER command sent: [0.04, 0.04]")
+
+    def on_close_real_gripper(self):
+        self.node.send_real_gripper(GRIPPER_CLOSE)
+        self.log("CLOSE REAL GRIPPER command sent: [0.0, 0.0]")
+
+    def get_custom_hold_params(self) -> Dict[str, object]:
+        return {
+            "target_model": self.object_name_edit.text().strip() or "pickup_box",
+            "tool_frame": "gripper_tip",
+            "debug_mode": self.debug_mode_checkbox.isChecked(),
+            "snap_on_pick": self.snap_pick_checkbox.isChecked(),
+            "preserve_relative_pose": self.preserve_relative_checkbox.isChecked(),
+            "exact_place_on_release": self.exact_place_checkbox.isChecked(),
+            "max_pick_distance": self.max_pick_distance_spin.value(),
+            "hold_offset_x": self.hold_x_spin.value(),
+            "hold_offset_y": self.hold_y_spin.value(),
+            "hold_offset_z": self.hold_z_spin.value(),
+            "hold_rpy_roll": 0.0,
+            "hold_rpy_pitch": 0.0,
+            "hold_rpy_yaw": 0.0,
+            "flat_object_orientation": self.flat_orientation_checkbox.isChecked(),
+            "verbose_debug": True,
+            "auto_move_object_to_pick_zone": self.auto_move_pick_zone_checkbox.isChecked(),
+            "use_pick_zone_for_distance": self.use_pick_zone_distance_checkbox.isChecked(),
+            "pick_zone_max_distance": self.pick_zone_max_distance_spin.value(),
+            "pick_x": self.pick_x_spin.value(),
+            "pick_y": self.pick_y_spin.value(),
+            "pick_z": self.pick_z_spin.value(),
+            "pick_qx": 0.0,
+            "pick_qy": 0.0,
+            "pick_qz": 0.0,
+            "pick_qw": 1.0,
+        }
+
+    def get_stable_hold_params(self) -> Dict[str, object]:
+        params = dict(STABLE_HOLD)
+        params["target_model"] = self.object_name_edit.text().strip() or "pickup_box"
+        params["tool_frame"] = "gripper_tip"
+        return params
+
+    def get_development_mode_params(self) -> Dict[str, object]:
+        params = self.get_stable_hold_params()
+        params["debug_mode"] = True
+        params["max_pick_distance"] = 0.0
+        return params
+
+    def get_demo_mode_params(self) -> Dict[str, object]:
+        params = self.get_stable_hold_params()
+        params["debug_mode"] = False
+        params["max_pick_distance"] = 0.5
+        return params
+
+    def get_pick_zone_params(self) -> Dict[str, object]:
+        return {
+            "target_model": self.object_name_edit.text().strip() or "pickup_box",
+            "auto_move_object_to_pick_zone": self.auto_move_pick_zone_checkbox.isChecked(),
+            "use_pick_zone_for_distance": self.use_pick_zone_distance_checkbox.isChecked(),
+            "pick_zone_max_distance": self.pick_zone_max_distance_spin.value(),
+            "pick_x": self.pick_x_spin.value(),
+            "pick_y": self.pick_y_spin.value(),
+            "pick_z": self.pick_z_spin.value(),
+            "pick_qx": 0.0,
+            "pick_qy": 0.0,
+            "pick_qz": 0.0,
+            "pick_qw": 1.0,
+        }
+
+    def on_apply_pick_zone_settings(self):
+        self.set_params_then(self.get_pick_zone_params(), lambda: self.log("Pick zone settings applied."))
+
+    def on_move_object_to_pick_zone(self):
+        def call_move():
+            self.log("Calling /move_object_to_pick_zone...")
+            try:
+                future = self.node.move_object_to_pick_zone_async()
+            except Exception as exc:
+                QMessageBox.warning(self, "Fake gripper V4.2 not ready", str(exc))
+                self.log(f"ERROR: {exc}")
+                return
+
+            def after_move_done(move_result_future):
+                try:
+                    response = move_result_future.result()
+                    self.log(f"MOVE PICK ZONE response: success={response.success}, message={response.message}")
+                except Exception as exc:
+                    self.log(f"ERROR: Move to pick zone failed: {exc}")
+
+            future.add_done_callback(after_move_done)
+
+        self.set_params_then(self.get_pick_zone_params(), call_move)
+
+    def get_place_params(self) -> Dict[str, object]:
+        return {
+            "exact_place_on_release": self.exact_place_checkbox.isChecked(),
+            "place_x": self.place_x_spin.value(),
+            "place_y": self.place_y_spin.value(),
+            "place_z": self.place_z_spin.value(),
+            "place_qx": 0.0,
+            "place_qy": 0.0,
+            "place_qz": 0.0,
+            "place_qw": 1.0,
+        }
+
+    def set_params_then(self, params: Dict[str, object], on_done):
+        try:
+            future = self.node.set_fake_gripper_params_async(params)
+        except Exception as exc:
+            QMessageBox.warning(self, "Fake gripper not ready", str(exc))
+            self.log(f"ERROR: {exc}")
+            return
+
+        def after_params_done(param_future):
+            try:
+                result = param_future.result()
+                ok = result is not None and all(r.successful for r in result.results)
+                if not ok:
+                    reasons = []
+                    if result is not None:
+                        reasons = [r.reason for r in result.results if not r.successful]
+                    self.log(f"ERROR: parameter set failed: {reasons}")
+                    return
+                self.log(f"Applied fake gripper params: {params}")
+                on_done()
+            except Exception as exc:
+                self.log(f"ERROR: Parameter future failed: {exc}")
+
+        future.add_done_callback(after_params_done)
+
+    def on_apply_stable_hold(self):
+        self.debug_mode_checkbox.setChecked(True)
+        self.snap_pick_checkbox.setChecked(True)
+        self.preserve_relative_checkbox.setChecked(False)
+        self.exact_place_checkbox.setChecked(False)
+        self.flat_orientation_checkbox.setChecked(False)
+        self.max_pick_distance_spin.setValue(0.0)
+        self.hold_x_spin.setValue(-0.12)
+        self.hold_y_spin.setValue(0.0)
+        self.hold_z_spin.setValue(-0.08)
+        self.auto_move_pick_zone_checkbox.setChecked(False)
+        self.use_pick_zone_distance_checkbox.setChecked(False)
+        self.pick_zone_max_distance_spin.setValue(0.35)
+        self.pick_x_spin.setValue(0.57)
+        self.pick_y_spin.setValue(0.0)
+        self.pick_z_spin.setValue(3.70)
+        self.set_params_then(self.get_stable_hold_params(), lambda: self.log("Stable hold applied."))
+
+    def on_development_mode(self):
+        self.debug_mode_checkbox.setChecked(True)
+        self.max_pick_distance_spin.setValue(0.0)
+        self.set_params_then(self.get_development_mode_params(), lambda: self.log("Development mode applied."))
+
+    def on_demo_mode(self):
+        self.debug_mode_checkbox.setChecked(False)
+        self.max_pick_distance_spin.setValue(0.5)
+        self.set_params_then(self.get_demo_mode_params(), lambda: self.log("Demo mode applied."))
+
+    def on_apply_custom_hold(self):
+        self.set_params_then(self.get_custom_hold_params(), lambda: self.log("Custom hold parameters applied."))
+
+    def on_apply_place_settings(self):
+        self.set_params_then(self.get_place_params(), lambda: self.log("Exact place settings applied."))
+
+    def on_pick_object(self):
+        def call_pick():
+            self.log("Calling /pick_object...")
+            try:
+                future = self.node.pick_object_async()
+            except Exception as exc:
+                QMessageBox.warning(self, "Fake gripper not ready", str(exc))
+                self.log(f"ERROR: {exc}")
+                return
+
+            def after_pick_done(pick_result_future):
+                try:
+                    response = pick_result_future.result()
+                    self.attached_state = bool(response.success)
+                    self.log(f"PICK response: success={response.success}, message={response.message}")
+                except Exception as exc:
+                    self.log(f"ERROR: Pick failed: {exc}")
+
+            future.add_done_callback(after_pick_done)
+
+        params = self.get_custom_hold_params()
+        self.set_params_then(params, call_pick)
+
+    def on_place_object(self):
+        """
+        V9 placement rule:
+        Do NOT re-send hold parameters during placement.
+        The previous stable hold values should remain untouched.
+        Only exact-place parameters are updated, then /place_object is called.
+        """
+        def call_place():
+            self.log("Calling /place_object...")
+            try:
+                future = self.node.place_object_async()
+            except Exception as exc:
+                QMessageBox.warning(self, "Fake gripper not ready", str(exc))
+                self.log(f"ERROR: {exc}")
+                return
+
+            def after_place_done(place_result_future):
+                try:
+                    response = place_result_future.result()
+                    if response.success:
+                        self.attached_state = False
+                    self.log(f"PLACE response: success={response.success}, message={response.message}")
+                except Exception as exc:
+                    self.log(f"ERROR: Place failed: {exc}")
+
+            future.add_done_callback(after_place_done)
+
+        self.set_params_then(self.get_place_params(), call_place)
+
+    def on_hybrid_pick(self):
+        self.log("HYBRID PICK: applying stable/custom params, closing real gripper, then calling /pick_object.")
+        self.node.send_real_gripper(GRIPPER_CLOSE)
+        QTimer.singleShot(500, self.on_pick_object)
+
+    def on_hybrid_place(self):
+        """
+        V9 precise placement rule:
+        1. Apply only place parameters.
+        2. Call /place_object while the fake object is still attached.
+        3. Open the real gripper after the object has been released/teleported.
+
+        This prevents the real finger collision from disturbing the object before
+        exact placement is completed.
+        """
+        self.log("HYBRID PLACE V9: calling /place_object first, then opening real gripper.")
+
+        def call_place():
+            self.log("Calling /place_object for precise release...")
+            try:
+                future = self.node.place_object_async()
+            except Exception as exc:
+                QMessageBox.warning(self, "Fake gripper not ready", str(exc))
+                self.log(f"ERROR: {exc}")
+                return
+
+            def after_place_done(place_result_future):
+                try:
+                    response = place_result_future.result()
+                    if response.success:
+                        self.attached_state = False
+                    self.log(f"PLACE response: success={response.success}, message={response.message}")
+                    QTimer.singleShot(300, self.on_open_real_gripper)
+                except Exception as exc:
+                    self.log(f"ERROR: Hybrid place failed: {exc}")
+
+            future.add_done_callback(after_place_done)
+
+        self.set_params_then(self.get_place_params(), call_place)
+
+    def on_teach(self):
+        target = self.current_positions_from_ui()
+        self.saved_targets.append(target)
+        item = QListWidgetItem("Target {}: {}".format(
+            len(self.saved_targets),
+            ", ".join(f"{v:.2f}" for v in target)
+        ))
+        self.target_list.addItem(item)
+        self.log(f"Taught target {len(self.saved_targets)}.")
+
+    def on_play_path(self):
+        if not self.saved_targets:
+            QMessageBox.warning(self, "No path", "Teach at least one target first.")
+            return
+
+        try:
+            self.node.send_path(self.selected_joint_names, self.saved_targets, self.duration_spin.value())
+            self.log(f"Playing taught path with {len(self.saved_targets)} targets.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Playback failed", str(exc))
+            self.log(f"ERROR: Playback failed: {exc}")
+
+    def on_clear_path(self):
+        self.saved_targets.clear()
+        self.target_list.clear()
+        self.log("Cleared taught path.")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BCRArmGuiNode()
+
+    app = QApplication(sys.argv)
+    window = BCRArmFactoryGUI(node)
+    window.show()
+
+    try:
+        sys.exit(app.exec_())
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+"""
+BCR Endpoint Object Attacher - V2.9 Gripper Top Attach + Auto Select
+
+attach_mode "gripper_top": on attach the object's top face is placed centered
+on the endpoint frame (the top of the gripper), it follows that pose while
+carried, and on release it is dropped from exactly the pose it was carried at.
+
+auto_select_target: on attach, grab whichever candidate model (the orbiting
+products of the dual bent) is closest to the gripper instead of target_model,
+using that product's own size and colour.
+"""
+
+import json
+import math
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Optional, Tuple
+
+import rclpy
+import rclpy.duration
+import rclpy.time
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+import tf2_ros
+
+# Prefer native gz-transport bindings: one set_pose call takes ~1 ms instead of
+# the ~50-100 ms a `gz service` subprocess needs, so the object no longer lags
+# behind the gripper. Falls back to the CLI when the bindings are missing.
+try:
+    from gz.transport13 import Node as GzNode
+    from gz.msgs10.boolean_pb2 import Boolean as GzBoolean
+    from gz.msgs10.pose_pb2 import Pose as GzPose
+    from gz.msgs10.pose_v_pb2 import Pose_V as GzPoseV
+    from gz.msgs10.twist_pb2 import Twist as GzTwist
+except ImportError:
+    GzNode = None
+
+# Products of dual_circular_factory_conveyor.sdf: size (x, y, z) and RGB colour.
+PRODUCT_CATALOG = {
+    "pickup_box": ((0.34, 0.26, 0.26), (0.90, 0.25, 0.10)),
+    "product_shipping_box_large": ((0.34, 0.26, 0.26), (0.45, 0.29, 0.13)),
+    "product_milk_carton": ((0.16, 0.10, 0.34), (0.97, 0.97, 0.98)),
+    "product_bottle_boxy": ((0.12, 0.12, 0.42), (0.25, 0.60, 0.95)),
+    "product_sneaker_pair": ((0.36, 0.20, 0.12), (0.12, 0.12, 0.15)),
+    "product_packet_pouch": ((0.18, 0.06, 0.24), (0.88, 0.80, 0.15)),
+    "product_shoe_box": ((0.34, 0.20, 0.14), (0.14, 0.20, 0.45)),
+    "product_long_package": ((0.48, 0.18, 0.18), (0.72, 0.20, 0.20)),
+}
+
+Pose7 = Tuple[float, float, float, float, float, float, float]
+
+
+def rotate_vector_by_quat(v: Tuple[float, float, float], q: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
+    qx, qy, qz, qw = q
+    vx, vy, vz = v
+    rx = vx + 2.0 * qw * (qy*vz - qz*vy) + 2.0 * (qx*(qx*vx + qy*vy + qz*vz) - vx*(qx*qx + qy*qy + qz*qz))
+    ry = vy + 2.0 * qw * (qz*vx - qx*vz) + 2.0 * (qy*(qx*vx + qy*vy + qz*vz) - vy*(qx*qx + qy*qy + qz*qz))
+    rz = vz + 2.0 * qw * (qx*vy - qy*vx) + 2.0 * (qz*(qx*vx + qy*vy + qz*vz) - vz*(qx*qx + qy*qy + qz*qz))
+    return rx, ry, rz
+
+
+def quat_normalize(q):
+    x, y, z, w = q
+    n = math.sqrt(x*x + y*y + z*z + w*w)
+    if n <= 1e-12:
+        return 0.0, 0.0, 0.0, 1.0
+    return x/n, y/n, z/n, w/n
+
+
+def rpy_to_quat(roll, pitch, yaw):
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    return quat_normalize((
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    ))
+
+
+def quat_multiply(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return quat_normalize((
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+        aw*bw - ax*bx - ay*by - az*bz,
+    ))
+
+
+def fmt_pose(p: Optional[Pose7]) -> str:
+    if p is None:
+        return "None"
+    return f"xyz=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}), quat=({p[3]:.3f}, {p[4]:.3f}, {p[5]:.3f}, {p[6]:.3f})"
+
+
+class BCREndpointObjectAttacher(Node):
+    def __init__(self):
+        super().__init__("bcr_endpoint_object_attacher")
+
+        self.declare_parameter("world_name", "dual_circular_factory_world")
+        self.declare_parameter("target_model", "pickup_box")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("endpoint_frame", "gripper_tip")
+
+        self.declare_parameter("base_x", -0.200)
+        self.declare_parameter("base_y", -0.154)
+        self.declare_parameter("base_z", -0.508)
+        self.declare_parameter("base_yaw", 0.0)
+
+        # gripper_top: object top face sits on the endpoint frame (+ contact_gap).
+        # endpoint: object center sits on the endpoint frame + attach_offset only.
+        self.declare_parameter("attach_mode", "gripper_top")
+        self.declare_parameter("contact_gap", 0.005)
+
+        # Extra fine-tuning offset, applied in "world" or "endpoint" frame.
+        self.declare_parameter("attach_offset_frame", "world")
+        self.declare_parameter("attach_offset_x", 0.0)
+        self.declare_parameter("attach_offset_y", 0.0)
+        self.declare_parameter("attach_offset_z", 0.0)
+
+        self.declare_parameter("attach_rpy_roll", 0.0)
+        self.declare_parameter("attach_rpy_pitch", 0.0)
+        self.declare_parameter("attach_rpy_yaw", 0.0)
+        self.declare_parameter("keep_object_world_flat", True)
+
+        self.declare_parameter("ghost_carry_on_attach", True)
+        self.declare_parameter("physical_release_on_release", True)
+        self.declare_parameter("carry_static", True)
+        self.declare_parameter("carry_gravity", False)
+        self.declare_parameter("carry_collision", False)
+        self.declare_parameter("release_static", False)
+        self.declare_parameter("release_gravity", True)
+        self.declare_parameter("release_collision", True)
+
+        self.declare_parameter("respawn_sleep_sec", 0.20)
+        self.declare_parameter("object_size_x", 0.34)
+        self.declare_parameter("object_size_y", 0.26)
+        self.declare_parameter("object_size_z", 0.26)
+        self.declare_parameter("object_mass", 0.20)
+        self.declare_parameter("object_ixx", 0.001)
+        self.declare_parameter("object_iyy", 0.001)
+        self.declare_parameter("object_izz", 0.001)
+
+        self.declare_parameter("pick_x", -2.175)
+        self.declare_parameter("pick_y", 1.195)
+        self.declare_parameter("pick_z", 2.006)
+        self.declare_parameter("pick_qx", 0.0)
+        self.declare_parameter("pick_qy", 0.0)
+        self.declare_parameter("pick_qz", 0.0)
+        self.declare_parameter("pick_qw", 1.0)
+
+        self.declare_parameter("exact_release", False)
+        self.declare_parameter("release_x", -2.175)
+        self.declare_parameter("release_y", 1.195)
+        self.declare_parameter("release_z", 1.90)
+        self.declare_parameter("release_qx", 0.0)
+        self.declare_parameter("release_qy", 0.0)
+        self.declare_parameter("release_qz", 0.0)
+        self.declare_parameter("release_qw", 1.0)
+
+        self.declare_parameter("update_hz", 25.0)
+        self.declare_parameter("gz_timeout_ms", 500)
+        self.declare_parameter("attach_settle_repeats", 3)
+        self.declare_parameter("attach_settle_sleep_sec", 0.03)
+        self.declare_parameter("release_settle_repeats", 3)
+        self.declare_parameter("release_settle_sleep_sec", 0.05)
+        self.declare_parameter("carry_retry_on_failure", True)
+        self.declare_parameter("carry_retry_sleep_sec", 0.015)
+
+        self.declare_parameter("auto_select_target", False)
+        self.declare_parameter("auto_select_radius", 1.0)
+        # When select_near_point is true, auto-select looks around (select_x, select_y)
+        # (the object position the camera predicted) instead of around the gripper tip.
+        self.declare_parameter("select_near_point", False)
+        # Products are driven by VelocityControl. On attach: zero their cmd_vel so they stop
+        # where they are, then lock them to the gripper with set_pose (no delete/respawn,
+        # which could race with Gazebo and leave nothing to hold).
+        self.declare_parameter("stop_and_follow_products", True)
+        self.declare_parameter("select_x", 0.0)
+        self.declare_parameter("select_y", 0.0)
+        self.declare_parameter("candidate_models", list(PRODUCT_CATALOG.keys()))
+        # /resume_held_object restarts a held product with the twist of the world file
+        # (VelocityControl initial_linear = 3.42 * omega, initial_angular = omega, omega 0.07).
+        self.declare_parameter("resume_linear_x", 0.2394)
+        self.declare_parameter("resume_angular_z", 0.07)
+        self.declare_parameter("hold_max_drift", 0.01)   # m the held product may still move in 0.25 s
+        # The whole bent: /stop_bent and /start_bent stop or restart every product on it.
+        # On a hold the whole bent stops; once the arm has the product the rest move on.
+        self.declare_parameter("hold_stops_bent", True)
+        self.declare_parameter("resume_bent_on_attach", True)
+        # Release onto the belt: the object is put down resting on release_surface_z (its bottom
+        # on the belt, clear of the gripper) instead of being re-created where it hung under the
+        # tip, overlapping the gripper, which made Gazebo throw it away from the place point.
+        self.declare_parameter("release_on_surface", True)
+        self.declare_parameter("release_surface_z", 1.375)
+        self.declare_parameter("release_use_yaw", False)   # true: put it down with yaw release_yaw
+        self.declare_parameter("release_yaw", 0.0)
+
+        self.attached = False
+        self.ghost_carry_enabled_now = False
+        self.last_object_pose: Optional[Pose7] = None
+        self.last_respawn_ok = True
+
+        self.attach_count = 0
+        self.release_count = 0
+        self.update_count = 0
+        self.failed_update_count = 0
+        self.respawn_count = 0
+        self.failed_respawn_count = 0
+
+        # Model chosen by auto_select_target for the current attach/carry/release.
+        self.active_model: Optional[str] = None
+        # True between /hold_object_for_pick and attach/resume: the product is stopped on the bent
+        self.held = False
+        self.bent_stopped = False
+        self.carry_lock = threading.Lock()   # the carry timer never moves the object during a release
+        self.model_poses = {}
+        self.model_poses_lock = threading.Lock()
+
+        self.gz_node = GzNode() if GzNode is not None else None
+        if self.gz_node is not None:
+            topic = f"/world/{self.get_str('world_name')}/pose/info"
+            try:
+                self.gz_node.subscribe(GzPoseV, topic, self.on_gz_poses)
+            except Exception as exc:
+                self.get_logger().warn(f"Could not subscribe to {topic}: {exc}")
+        # cmd_vel publishers advertised up front so discovery is done before the first catch
+        self.cmd_vel_pubs = {}
+        if self.gz_node is not None:
+            for name in self.get_parameter("candidate_models").value:
+                try:
+                    self.cmd_vel_pubs[name] = self.gz_node.advertise(f"/model/{name}/cmd_vel", GzTwist)
+                except Exception as exc:
+                    self.get_logger().warn(f"Could not advertise /model/{name}/cmd_vel: {exc}")
+        self.get_logger().info(
+            "Using gz-transport Python bindings for set_pose." if self.gz_node
+            else "gz-transport Python bindings not found; using `gz service` CLI (slower follow)."
+        )
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # Services, the carry timer and TF each in their own callback group, spun by a
+        # MultiThreadedExecutor (main): with the slow `gz service` CLI the timer kept the
+        # single-threaded node busy, TF updates queued behind it and the carried object
+        # stayed at the pick pose.
+        srv_cb = MutuallyExclusiveCallbackGroup()
+        self.create_service(Trigger, "/attach_object_to_endpoint", self.attach_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/release_object_from_endpoint", self.release_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/move_object_to_endpoint_pick", self.move_to_pick_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/get_endpoint_attach_status", self.status_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/hold_object_for_pick", self.hold_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/resume_held_object", self.resume_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/stop_bent", self.stop_bent_callback, callback_group=srv_cb)
+        self.create_service(Trigger, "/start_bent", self.start_bent_callback, callback_group=srv_cb)
+
+        update_hz = max(1.0, self.get_float("update_hz"))
+        self.timer = self.create_timer(1.0 / update_hz, self.timer_callback, callback_group=MutuallyExclusiveCallbackGroup())
+
+        self.get_logger().info("BCR Stable Endpoint Attacher Node Ready.")
+
+    def get_str(self, name): return str(self.get_parameter(name).value)
+    def get_float(self, name): return float(self.get_parameter(name).value)
+    def get_bool(self, name): return bool(self.get_parameter(name).value)
+    def get_int(self, name): return int(self.get_parameter(name).value)
+
+    def model_name(self) -> str:
+        return self.active_model or self.get_str("target_model")
+
+    def object_size(self) -> Tuple[float, float, float]:
+        if self.active_model in PRODUCT_CATALOG:
+            return PRODUCT_CATALOG[self.active_model][0]
+        return self.get_float("object_size_x"), self.get_float("object_size_y"), self.get_float("object_size_z")
+
+    def object_color(self) -> Tuple[float, float, float]:
+        if self.active_model in PRODUCT_CATALOG:
+            return PRODUCT_CATALOG[self.active_model][1]
+        return 0.9, 0.2, 0.1
+
+    def on_gz_poses(self, msg):
+        with self.model_poses_lock:
+            for p in msg.pose:
+                if p.name:
+                    self.model_poses[p.name] = (p.position.x, p.position.y, p.position.z)
+
+    def read_model_poses(self):
+        """Model positions from gz-transport, or one `gz topic -e` sample as a fallback."""
+        with self.model_poses_lock:
+            if self.model_poses:
+                return dict(self.model_poses)
+        cmd = ["gz", "topic", "-e", "-n", "1", "-t", f"/world/{self.get_str('world_name')}/pose/info"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
+        poses = {}
+        for m in re.finditer(r'name:\s*"([^"]+)".*?position\s*\{([^}]*)\}', res.stdout, re.S):
+            vals = dict(re.findall(r'(\w):\s*(-?[\d.eE+-]+)', m.group(2)))
+            poses[m.group(1)] = (float(vals.get("x", 0)), float(vals.get("y", 0)), float(vals.get("z", 0)))
+        return poses
+
+    def select_nearest_candidate(self) -> str:
+        if self.get_bool("select_near_point"):
+            ref, ref_name = (self.get_float("select_x"), self.get_float("select_y")), "the detected object"
+        else:
+            ref, ref_name = self.get_endpoint_pose_world(), "the gripper"
+        tip = ref
+        poses = self.read_model_poses()
+        if not any(name in poses for name in self.get_parameter("candidate_models").value):
+            raise RuntimeError("no product poses from Gazebo (/world/<world>/pose/info); check world_name "
+                               f"'{self.get_str('world_name')}' and that the dual bent world with product_* models is loaded")
+        best, best_d = None, float("inf")
+        for name in self.get_parameter("candidate_models").value:
+            if name in poses:
+                d = math.hypot(poses[name][0] - tip[0], poses[name][1] - tip[1])
+                if d < best_d:
+                    best, best_d = name, d
+        if best is None or best_d > self.get_float("auto_select_radius"):
+            raise RuntimeError(f"no candidate model within {self.get_float('auto_select_radius'):.2f} m of {ref_name} "
+                               f"(nearest: {best}, {best_d:.2f} m)")
+        self.get_logger().info(f"Auto-selected {best} ({best_d:.2f} m from {ref_name}).")
+        return best
+
+    def get_attach_quat(self):
+        return rpy_to_quat(self.get_float("attach_rpy_roll"), self.get_float("attach_rpy_pitch"), self.get_float("attach_rpy_yaw"))
+
+    def get_pick_pose(self) -> Pose7:
+        return self.get_float("pick_x"), self.get_float("pick_y"), self.get_float("pick_z"), 0.0, 0.0, 0.0, 1.0
+
+    def get_release_pose(self) -> Pose7:
+        return self.get_float("release_x"), self.get_float("release_y"), self.get_float("release_z"), 0.0, 0.0, 0.0, 1.0
+
+    def get_endpoint_pose_world(self) -> Pose7:
+        tf = self.tf_buffer.lookup_transform(self.get_str("base_frame"), self.get_str("endpoint_frame"), rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.3))
+        t = tf.transform.translation
+        r = tf.transform.rotation
+
+        # base_frame -> world: rotate by the arm's spawn yaw, then translate.
+        base_yaw = self.get_float("base_yaw")
+        base_quat = (0.0, 0.0, math.sin(base_yaw * 0.5), math.cos(base_yaw * 0.5))
+        wx, wy, wz = rotate_vector_by_quat((t.x, t.y, t.z), base_quat)
+        q = quat_multiply(base_quat, (r.x, r.y, r.z, r.w))
+        return (
+            self.get_float("base_x") + wx,
+            self.get_float("base_y") + wy,
+            self.get_float("base_z") + wz,
+            q[0], q[1], q[2], q[3]
+        )
+
+    def get_attached_object_pose(self) -> Pose7:
+        endpoint = self.get_endpoint_pose_world()
+        endpoint_quat = (endpoint[3], endpoint[4], endpoint[5], endpoint[6])
+        x, y, z = endpoint[0], endpoint[1], endpoint[2]
+
+        if self.get_str("attach_mode") == "gripper_top":
+            # Model origin is the box center, so hang it half its height below the tip.
+            z -= 0.5 * self.object_size()[2] + self.get_float("contact_gap")
+
+        offset = (self.get_float("attach_offset_x"), self.get_float("attach_offset_y"), self.get_float("attach_offset_z"))
+        if self.get_str("attach_offset_frame") == "endpoint":
+            offset = rotate_vector_by_quat(offset, endpoint_quat)
+        x += offset[0]
+        y += offset[1]
+        z += offset[2]
+
+        if self.get_bool("keep_object_world_flat"):
+            siny_cosp = 2.0 * (endpoint_quat[3] * endpoint_quat[2] + endpoint_quat[0] * endpoint_quat[1])
+            cosy_cosp = 1.0 - 2.0 * (endpoint_quat[1] * endpoint_quat[1] + endpoint_quat[2] * endpoint_quat[2])
+            gripper_yaw = math.atan2(siny_cosp, cosy_cosp)
+            return x, y, z, 0.0, 0.0, math.sin(gripper_yaw * 0.5), math.cos(gripper_yaw * 0.5)
+
+        return x, y, z, endpoint[3], endpoint[4], endpoint[5], endpoint[6]
+
+    def set_gazebo_model_pose_once(self, pose: Pose7) -> bool:
+        x, y, z, qx, qy, qz, qw = pose
+        service = f"/world/{self.get_str('world_name')}/set_pose"
+        if self.gz_node is not None:
+            req = GzPose()
+            req.name = self.model_name()
+            req.position.x, req.position.y, req.position.z = x, y, z
+            req.orientation.x, req.orientation.y, req.orientation.z, req.orientation.w = qx, qy, qz, qw
+            try:
+                ok, rep = self.gz_node.request(service, req, GzPose, GzBoolean, self.get_int("gz_timeout_ms"))
+                return bool(ok and rep.data)
+            except Exception:
+                return False
+
+        req = f'name: "{self.model_name()}", position: {{x: {x}, y: {y}, z: {z}}}, orientation: {{x: {qx}, y: {qy}, z: {qz}, w: {qw}}}'
+        cmd = ["gz", "service", "-s", service, "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean", "--timeout", str(self.get_int("gz_timeout_ms")), "--req", req]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1.0)
+            return res.returncode == 0 and "data: false" not in res.stdout
+        except Exception:
+            return False
+
+    def set_pose_repeated(self, pose: Pose7, repeats: int, sleep_sec: float) -> bool:
+        ok = True
+        for _ in range(max(1, repeats)):
+            ok = self.set_gazebo_model_pose_once(pose) and ok
+            time.sleep(max(0.0, sleep_sec))
+        return ok
+
+    def object_sdf_text(self, static_enabled: bool, gravity_enabled: bool, collision_enabled: bool) -> str:
+        model = self.model_name()
+        sx, sy, sz = self.object_size()
+        r, g, b = self.object_color()
+        static_s = "true" if static_enabled else "false"
+        gravity_s = "true" if gravity_enabled else "false"
+        collision_block = f'<collision name="collision"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry></collision>' if collision_enabled else ""
+        return f'<?xml version="1.0" ?><sdf version="1.8"><model name="{model}"><static>{static_s}</static><link name="link"><gravity>{gravity_s}</gravity><inertial><mass>{self.get_float("object_mass")}</mass><inertia><ixx>{self.get_float("object_ixx")}</ixx><iyy>{self.get_float("object_iyy")}</iyy><izz>{self.get_float("object_izz")}</izz></inertia></inertial>{collision_block}<visual name="visual"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry><material><ambient>{r} {g} {b} 1</ambient><diffuse>{r} {g} {b} 1</diffuse></material></visual></link></model></sdf>'
+
+    def stop_model_motion(self, name: str, linear_x: float = 0.0, angular_z: float = 0.0, use_cli: bool = False):
+        """Set the product's VelocityControl command (zero = it stops moving along the bent)."""
+        pub = self.cmd_vel_pubs.get(name)
+        if pub is not None and not use_cli:
+            msg = GzTwist()
+            msg.linear.x, msg.angular.z = linear_x, angular_z
+            for _ in range(5):
+                pub.publish(msg)
+                time.sleep(0.02)
+            return
+        cmd = ["gz", "topic", "-t", f"/model/{name}/cmd_vel", "-m", "gz.msgs.Twist",
+               "-p", f"linear: {{x: {linear_x}, y: 0, z: 0}}, angular: {{x: 0, y: 0, z: {angular_z}}}"]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
+
+    def set_models_twist(self, names, linear_x: float, angular_z: float):
+        """Send the same VelocityControl command to several products at once."""
+        names = list(names)
+        cli = [n for n in names if n not in self.cmd_vel_pubs]
+        for _ in range(5):
+            for n in names:
+                if n in self.cmd_vel_pubs:
+                    msg = GzTwist()
+                    msg.linear.x, msg.angular.z = linear_x, angular_z
+                    self.cmd_vel_pubs[n].publish(msg)
+            time.sleep(0.02)
+        # without gz-transport bindings: one `gz topic` per product, all started together
+        procs = [subprocess.Popen(["gz", "topic", "-t", f"/model/{n}/cmd_vel", "-m", "gz.msgs.Twist", "-p",
+                                   f"linear: {{x: {linear_x}, y: 0, z: 0}}, angular: {{x: 0, y: 0, z: {angular_z}}}"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for n in cli]
+        for p in procs:
+            try:
+                p.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    def bent_models(self, exclude=()):
+        return [n for n in self.get_parameter("candidate_models").value if n not in exclude]
+
+    def stop_bent(self, exclude=()):
+        """Stop the bent: every product on it stands still (except `exclude`)."""
+        names = self.bent_models(exclude)
+        self.set_models_twist(names, 0.0, 0.0)
+        self.bent_stopped = True
+        self.get_logger().info(f"Bent stopped ({len(names)} products).")
+        return names
+
+    def start_bent(self, exclude=()):
+        """Restart the bent: every product (except `exclude`) moves on along the ring again."""
+        names = self.bent_models(exclude)
+        self.set_models_twist(names, self.get_float("resume_linear_x"), self.get_float("resume_angular_z"))
+        self.bent_stopped = False
+        self.get_logger().info(f"Bent running again ({len(names)} products" + (f", not {list(exclude)}" if exclude else "") + ").")
+        return names
+
+    def busy_models(self):
+        """The product the arm has or is holding still: never restarted by /start_bent."""
+        return [self.active_model] if self.active_model and (self.attached or self.held) else []
+
+    def stop_bent_callback(self, request, response):
+        try:
+            names = self.stop_bent()
+            response.success, response.message = True, f"Bent stopped: {len(names)} products."
+        except Exception as exc:
+            response.success, response.message = False, f"Error: {exc}"
+        return response
+
+    def start_bent_callback(self, request, response):
+        try:
+            busy = self.busy_models()
+            names = self.start_bent(exclude=busy)
+            response.success = True
+            response.message = f"Bent running: {len(names)} products" + (f" (kept {busy[0]} with the arm)" if busy else "") + "."
+        except Exception as exc:
+            response.success, response.message = False, f"Error: {exc}"
+        return response
+
+    def model_drift(self, name: str, wait: float = 0.25):
+        """Pose of the model and how far it moved in `wait` seconds."""
+        p1 = self.read_model_poses().get(name)
+        time.sleep(wait)
+        p2 = self.read_model_poses().get(name)
+        if p1 is None or p2 is None:
+            raise RuntimeError(f"no Gazebo pose for {name}")
+        return p2, math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+    def hold_callback(self, request, response):
+        """Stop the product nearest (select_x, select_y) on the bent so the arm can come down onto it."""
+        try:
+            if self.attached:
+                raise RuntimeError(f"already carrying {self.model_name()}")
+            if self.held and self.active_model:
+                name = self.active_model
+            else:
+                name = self.select_nearest_candidate()
+            self.active_model = name
+            if self.get_bool("hold_stops_bent"):
+                self.stop_bent()          # the whole bent stops, not only this product
+            else:
+                self.stop_model_motion(name)
+            time.sleep(0.1)
+            pose, drift = self.model_drift(name)
+            if drift > self.get_float("hold_max_drift"):
+                # gz-transport publish did not reach VelocityControl: try the CLI once
+                self.stop_model_motion(name, use_cli=True)
+                time.sleep(0.2)
+                pose, drift = self.model_drift(name)
+            if drift > self.get_float("hold_max_drift"):
+                raise RuntimeError(f"{name} keeps moving ({drift / 0.25:.2f} m/s) after a zero /model/{name}/cmd_vel; "
+                                   "is its VelocityControl plugin listening on that topic?")
+            self.held = True
+            size = self.object_size()
+            info = {"model": name, "x": pose[0], "y": pose[1], "z": pose[2], "size": list(size),
+                    "top_z": pose[2] + 0.5 * size[2]}
+            self.get_logger().info(f"Holding {name} still at ({pose[0]:.3f}, {pose[1]:.3f}), top z {info['top_z']:.3f}.")
+            response.success = True
+            response.message = json.dumps(info)
+            return response
+        except Exception as exc:
+            if not self.held:
+                self.active_model = None
+            response.success = False
+            response.message = f"Error: {exc}"
+            return response
+
+    def resume_callback(self, request, response):
+        """Let a held (not attached) product carry on along the bent."""
+        try:
+            if self.attached:
+                raise RuntimeError(f"{self.model_name()} is attached; release it instead")
+            if not self.held or not self.active_model:
+                raise RuntimeError("no product is held")
+            name = self.active_model
+            if self.bent_stopped:
+                self.start_bent()
+            else:
+                self.stop_model_motion(name, self.get_float("resume_linear_x"), self.get_float("resume_angular_z"))
+            self.held = False
+            self.active_model = None
+            response.success = True
+            response.message = f"Resumed {name} along the bent."
+            return response
+        except Exception as exc:
+            response.success = False
+            response.message = f"Error: {exc}"
+            return response
+
+    def is_moving_product(self) -> bool:
+        return self.get_bool("stop_and_follow_products") and self.model_name() in PRODUCT_CATALOG
+
+    def remove_model(self) -> bool:
+        cmd = ["gz", "service", "-s", f"/world/{self.get_str('world_name')}/remove", "--reqtype", "gz.msgs.Entity", "--reptype", "gz.msgs.Boolean", "--timeout", "1000", "--req", f'name: "{self.model_name()}", type: MODEL']
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
+        return res.returncode == 0 and "data: false" not in res.stdout
+
+    def create_model_from_file(self, pose: Pose7, static_enabled: bool, gravity_enabled: bool, collision_enabled: bool) -> bool:
+        mode = f"{'st' if static_enabled else 'dy'}_{'g1' if gravity_enabled else 'g0'}_{'c1' if collision_enabled else 'c0'}"
+        path = Path(f"/tmp/{self.model_name()}_{mode}.sdf")
+        path.write_text(self.object_sdf_text(static_enabled, gravity_enabled, collision_enabled))
+        req = f'name: "{self.model_name()}", sdf_filename: "{str(path)}", allow_renaming: false, pose: {{position: {{x: {pose[0]}, y: {pose[1]}, z: {pose[2]}}}, orientation: {{x: {pose[3]}, y: {pose[4]}, z: {pose[5]}, w: {pose[6]}}}}}'
+        cmd = ["gz", "service", "-s", f"/world/{self.get_str('world_name')}/create", "--reqtype", "gz.msgs.EntityFactory", "--reptype", "gz.msgs.Boolean", "--timeout", "1500", "--req", req]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.5)
+        return res.returncode == 0 and "data: false" not in res.stdout
+
+    def respawn_model(self, pose: Pose7, static_enabled: bool, gravity_enabled: bool, collision_enabled: bool) -> bool:
+        self.remove_model()
+        time.sleep(self.get_float("respawn_sleep_sec"))
+        # create fails while Gazebo still has the old model under this name: retry until it is gone
+        for _ in range(10):
+            if self.create_model_from_file(pose, static_enabled, gravity_enabled, collision_enabled):
+                time.sleep(self.get_float("respawn_sleep_sec"))
+                return True
+            time.sleep(0.2)
+        self.get_logger().error(f"Could not re-create {self.model_name()} after removing it.")
+        return False
+
+    def status_message(self):
+        return f"attached={self.attached}, held={self.held}, model={self.model_name()}, last_pose={fmt_pose(self.last_object_pose)}"
+
+    def attach_callback(self, request, response):
+        try:
+            # a product stopped by /hold_object_for_pick is grabbed as is, without re-selecting
+            if self.get_bool("auto_select_target") and not (self.held and self.active_model):
+                self.active_model = self.select_nearest_candidate()
+            object_pose = self.get_attached_object_pose()
+
+            if self.is_moving_product():
+                # stop it on the bent first, then it is simply carried by set_pose each tick
+                self.stop_model_motion(self.model_name())
+            # Ghost first, so the teleport to the gripper cannot collide with the arm.
+            elif self.get_bool("ghost_carry_on_attach"):
+                self.respawn_model(object_pose, static_enabled=True, gravity_enabled=False, collision_enabled=False)
+
+            # Re-read the tip: the arm may have moved during the respawn.
+            object_pose = self.get_attached_object_pose()
+            ok = self.set_pose_repeated(object_pose, self.get_int("attach_settle_repeats"), self.get_float("attach_settle_sleep_sec"))
+            if not ok:
+                raise RuntimeError(f"Gazebo set_pose failed for {self.model_name()} (world '{self.get_str('world_name')}')")
+            self.last_object_pose = object_pose
+            self.update_count = 0
+            self.failed_update_count = 0
+            self.attached = True
+            self.held = False
+            if self.bent_stopped and self.get_bool("resume_bent_on_attach"):
+                self.start_bent(exclude=[self.model_name()])   # the arm has it: the others move on
+
+            response.success = True
+            response.message = f"Attached {self.model_name()} to {self.get_str('endpoint_frame')} at {fmt_pose(object_pose)}"
+            return response
+        except Exception as exc:
+            if not self.held:
+                self.active_model = None   # a held product stays held so it can be resumed
+            response.success = False
+            response.message = f"Error: {exc}"
+            return response
+
+    def release_callback(self, request, response):
+        try:
+            # Stop following first (and wait for a carry update in flight), then freeze the pose.
+            self.attached = False
+            with self.carry_lock:
+                pass
+            try:
+                carried = self.get_attached_object_pose()
+            except Exception:
+                carried = self.last_object_pose
+            if self.get_bool("exact_release"):
+                release_pose = self.get_release_pose()
+            else:
+                release_pose = carried
+            if release_pose is None:
+                raise RuntimeError("no carried pose known; attach first")
+            x, y, z, qx, qy, qz, qw = release_pose
+            if self.get_bool("release_on_surface"):
+                z = self.get_float("release_surface_z") + 0.5 * self.object_size()[2] + 0.003
+            if self.get_bool("release_use_yaw"):
+                yaw = self.get_float("release_yaw")
+                qx, qy, qz, qw = 0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)
+            release_pose = (x, y, z, qx, qy, qz, qw)
+            offset = None if carried is None else math.hypot(carried[0] - x, carried[1] - y)
+
+            self.set_pose_repeated(release_pose, self.get_int("release_settle_repeats"), self.get_float("release_settle_sleep_sec"))
+
+            # Respawn as a dynamic body at the same pose; gravity then drops it straight down.
+            if self.get_bool("physical_release_on_release"):
+                self.respawn_model(release_pose, static_enabled=False, gravity_enabled=True, collision_enabled=True)
+            self.last_object_pose = release_pose
+
+            response.success = True
+            response.message = (f"Released {self.model_name()} at {fmt_pose(release_pose)} "
+                                + (f"({offset:.3f} m from where the gripper carried it) " if offset is not None else "")
+                                + f"(carry updates ok {self.update_count}, failed {self.failed_update_count})")
+            self.active_model = None
+            self.held = False
+            return response
+        except Exception as exc:
+            response.success = False
+            response.message = f"Error: {exc}"
+            return response
+
+    def move_to_pick_callback(self, request, response):
+        try:
+            self.attached = False
+            pose = self.get_pick_pose()
+            self.respawn_model(pose, static_enabled=False, gravity_enabled=True, collision_enabled=True)
+            response.success = self.set_pose_repeated(pose, 3, 0.03)
+            return response
+        except Exception as exc:
+            response.success = False
+            return response
+
+    def status_callback(self, request, response):
+        response.success = True
+        response.message = self.status_message()
+        return response
+
+    def timer_callback(self):
+        with self.carry_lock:
+            self.carry_tick()
+
+    def carry_tick(self):
+        if not self.attached: return
+        try:
+            pose = self.get_attached_object_pose()
+        except Exception as exc:
+            self.get_logger().warn(f"Carry: no gripper pose from TF ({exc}); object not moved.", throttle_duration_sec=2.0)
+            return
+        ok = self.set_gazebo_model_pose_once(pose)
+        if not ok and self.get_bool("carry_retry_on_failure"):
+            time.sleep(self.get_float("carry_retry_sleep_sec"))
+            ok = self.set_gazebo_model_pose_once(pose)
+        if ok:
+            self.last_object_pose = pose
+            self.update_count += 1
+        else:
+            self.failed_update_count += 1
+            self.get_logger().warn(f"Carry: set_pose for {self.model_name()} failed "
+                                   f"({self.failed_update_count} failures so far).", throttle_duration_sec=2.0)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BCREndpointObjectAttacher()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        if rclpy.ok(): rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()

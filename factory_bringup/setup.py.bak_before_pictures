@@ -1,0 +1,37 @@
+from setuptools import setup
+from glob import glob
+import os
+
+package_name = 'factory_bringup'
+
+setup(
+    name=package_name,
+    version='0.0.1',
+    packages=[package_name],
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+         ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'),
+         glob('launch/*.launch.py')),
+    ],
+    entry_points={
+        'console_scripts': [
+            'bcr_arm_simple_ui = factory_bringup.bcr_arm_simple_ui:main',
+            'bcr_fake_gripper = factory_bringup.bcr_fake_gripper_old:main',
+            'bcr_endpoint_object_attacher = factory_bringup.bcr_endpoint_object_attacher:main',
+            'ring_object_detector = factory_bringup.ring_object_detector:main',
+            'vision_pick_place = factory_bringup.vision_pick_place:main',
+            'side_camera_checker = factory_bringup.side_camera_checker:main',
+            'release_zone_monitor = factory_bringup.release_zone_monitor:main',
+            'order_gui = factory_bringup.order_gui:main',
+
+        ],
+    },
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='factory_bent_project',
+    maintainer_email='huseyintozluyurt@hotmail.com',
+    description='Bringup launch files for factory conveyor and robotic arm simulation.',
+    license='Apache-2.0',
+)

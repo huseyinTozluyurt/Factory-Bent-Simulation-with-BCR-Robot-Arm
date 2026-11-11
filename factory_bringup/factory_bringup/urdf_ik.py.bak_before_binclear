@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+Minimal URDF kinematic chain with forward kinematics and position IK (no ROS imports).
+
+The chain is read from the robot_description string, so it follows whatever
+xacro the BCR arm launch uses. IK is damped least squares on the tip position,
+with a null-space pull toward a seed posture so the solution keeps the shape
+of a hand-taught pose (e.g. the UI's "Pick Contact" preset).
+"""
+
+import math
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+
+def _rpy_matrix(r, p, y):
+    cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ])
+
+
+def _axis_angle(axis, angle):
+    x, y, z = axis
+    c, s = math.cos(angle), math.sin(angle)
+    C = 1 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ])
+
+
+def _transform(R=None, t=None):
+    T = np.eye(4)
+    if R is not None:
+        T[:3, :3] = R
+    if t is not None:
+        T[:3, 3] = t
+    return T
+
+
+@dataclass
+class ChainJoint:
+    name: str
+    type: str
+    origin: np.ndarray
+    axis: np.ndarray
+    lower: float
+    upper: float
+
+
+class UrdfChain:
+    def __init__(self, urdf_xml: str, base_link: str, tip_link: str):
+        root = ET.fromstring(urdf_xml)
+        by_child = {}
+        for j in root.findall("joint"):
+            by_child[j.find("child").attrib["link"]] = j
+
+        chain: List[ChainJoint] = []
+        link = tip_link
+        while link != base_link:
+            j = by_child.get(link)
+            if j is None:
+                raise ValueError(f"No joint chain from '{base_link}' to '{tip_link}' (stuck at '{link}')")
+            o = j.find("origin")
+            xyz = [float(v) for v in (o.attrib.get("xyz", "0 0 0").split() if o is not None else [0, 0, 0])]
+            rpy = [float(v) for v in (o.attrib.get("rpy", "0 0 0").split() if o is not None else [0, 0, 0])]
+            a = j.find("axis")
+            axis = np.array([float(v) for v in (a.attrib.get("xyz", "1 0 0").split() if a is not None else [1, 0, 0])])
+            axis = axis / max(1e-12, np.linalg.norm(axis))
+            lim = j.find("limit")
+            jtype = j.attrib["type"]
+            if jtype == "continuous" or lim is None:
+                lower, upper = -math.pi * 2, math.pi * 2
+            else:
+                lower, upper = float(lim.attrib.get("lower", -math.pi)), float(lim.attrib.get("upper", math.pi))
+            chain.append(ChainJoint(j.attrib["name"], jtype, _transform(_rpy_matrix(*rpy), xyz), axis, lower, upper))
+            link = j.find("parent").attrib["link"]
+        chain.reverse()
+        self.chain = chain
+        self.movable = [j for j in chain if j.type in ("revolute", "continuous", "prismatic")]
+        self.names = [j.name for j in self.movable]
+
+    def fk(self, q: Dict[str, float]) -> np.ndarray:
+        T = np.eye(4)
+        for j in self.chain:
+            T = T @ j.origin
+            if j.type in ("revolute", "continuous"):
+                T = T @ _transform(_axis_angle(j.axis, q.get(j.name, 0.0)))
+            elif j.type == "prismatic":
+                T = T @ _transform(t=j.axis * q.get(j.name, 0.0))
+        return T
+
+    def tip_position(self, q: Dict[str, float]) -> np.ndarray:
+        return self.fk(q)[:3, 3]
+
+    def solve_position(
+        self,
+        target: Sequence[float],
+        seeds: List[Dict[str, float]],
+        active: Optional[List[str]] = None,
+        fixed: Optional[Dict[str, float]] = None,
+        iterations: int = 300,
+        damping: float = 0.05,
+        posture_gain: float = 0.05,
+        max_step: float = 0.2,
+    ) -> Tuple[Dict[str, float], float]:
+        """Returns (joint solution, position error in m) of the best seed."""
+        target = np.asarray(target, dtype=float)
+        active = [n for n in (active or self.names) if n in self.names]
+        lim = {j.name: (j.lower, j.upper) for j in self.movable}
+        best_q, best_err = None, float("inf")
+
+        for seed in seeds:
+            q = dict(fixed or {})
+            q.update({n: float(seed.get(n, 0.0)) for n in active})
+            for _ in range(iterations):
+                p = self.tip_position(q)
+                e = target - p
+                err = float(np.linalg.norm(e))
+                if err < 1e-4:
+                    break
+                J = np.zeros((3, len(active)))
+                h = 1e-5
+                for i, n in enumerate(active):
+                    q[n] += h
+                    J[:, i] = (self.tip_position(q) - p) / h
+                    q[n] -= h
+                JJt = J @ J.T + (damping ** 2) * np.eye(3)
+                J_pinv = J.T @ np.linalg.solve(JJt, np.eye(3))
+                dq = J_pinv @ e
+                # null-space pull toward the seed posture
+                q_vec = np.array([q[n] for n in active])
+                s_vec = np.array([seed.get(n, 0.0) for n in active])
+                dq += (np.eye(len(active)) - J_pinv @ J) @ (posture_gain * (s_vec - q_vec))
+                norm = np.linalg.norm(dq)
+                if norm > max_step:
+                    dq *= max_step / norm
+                for i, n in enumerate(active):
+                    lo, hi = lim[n]
+                    q[n] = min(hi, max(lo, q[n] + float(dq[i])))
+            err = float(np.linalg.norm(target - self.tip_position(q)))
+            if err < best_err:
+                best_q, best_err = dict(q), err
+        return best_q, best_err

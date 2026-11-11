@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+Product Order GUI (PyQt5) - choose which products go on the first bent, in which order.
+
+Left: every product type of product_catalog.py (the world's products and the new ones),
+shown with its picture from the simulation (product_images/<type>.png, taken in Gazebo by
+capture_product_images; button "Take pictures in Gazebo"), and a large preview with size
+and shape of the selected one. Add types to the order on the right, sort them with
+Up / Down, then "Spawn order" puts them on bent 1 in that order, the same distance
+apart along the belt; the first one arrives at the catch station first. The vision
+pick and place then picks them one by one as usual.
+
+ROS side (served by bcr_endpoint_object_attacher):
+  publishes   /spawn_order          std_msgs/String JSON {"items": [type, ...], "spacing", "start_offset", "clear"}
+  subscribes  /spawn_order/result   std_msgs/String JSON {"ok", "message"}
+  calls       /stop_bent1 /start_bent1 /stop_bent2 /start_bent2  (std_srvs/Trigger)
+
+Run:  ros2 run factory_bringup order_gui
+"""
+
+import json
+import os
+import sys
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+from PyQt5.QtCore import QProcess, QSize, Qt, QTimer
+from PyQt5.QtGui import QColor, QIcon, QPixmap
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+                             QLabel, QListView, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton,
+                             QSpinBox, QVBoxLayout, QWidget)
+
+from factory_bringup.product_catalog import PRODUCT_IMAGE_DIR, PRODUCT_TYPES, max_items
+
+RING1_RADIUS = 3.42   # must match ring1_radius of the attacher
+
+
+def image_dirs():
+    """Where product pictures are looked for, first match wins."""
+    dirs = [os.environ.get("FACTORY_PRODUCT_IMAGES", ""), os.path.expanduser(PRODUCT_IMAGE_DIR)]
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        dirs.append(os.path.join(get_package_share_directory("factory_bringup"), "product_images"))
+    except Exception:
+        pass
+    return [d for d in dirs if d]
+
+
+_pixmaps = {}
+
+
+def picture(ptype: str) -> QPixmap:
+    """The product's picture from the simulation, or a plain colour square when there is none yet."""
+    if ptype not in _pixmaps:
+        pix = QPixmap()
+        for d in image_dirs():
+            path = os.path.join(d, ptype + ".png")
+            if os.path.isfile(path) and pix.load(path):
+                break
+        if pix.isNull():
+            r, g, b = PRODUCT_TYPES[ptype]["rgb"]
+            pix = QPixmap(64, 64)
+            pix.fill(QColor(int(r * 255), int(g * 255), int(b * 255)))
+        _pixmaps[ptype] = pix
+    return _pixmaps[ptype]
+
+
+def swatch(ptype: str) -> QIcon:
+    return QIcon(picture(ptype))
+
+
+def describe(ptype: str) -> str:
+    t = PRODUCT_TYPES[ptype]
+    sx, sy, sz = t["size"]
+    size = f"d {sx * 100:.0f} x h {sz * 100:.0f} cm" if t["shape"] == "cylinder" else \
+        f"{sx * 100:.0f} x {sy * 100:.0f} x {sz * 100:.0f} cm"
+    return f"{t['label']}   ({t['shape']}, {size})"
+
+
+class OrderNode(Node):
+    def __init__(self):
+        super().__init__("product_order_gui")
+        self.order_pub = self.create_publisher(String, "/spawn_order", 10)
+        self.results = []
+        self.create_subscription(String, "/spawn_order/result", lambda m: self.results.append(m.data), 10)
+        self.trigger_clients = {name: self.create_client(Trigger, name)
+                                for name in ("/stop_bent1", "/start_bent1", "/stop_bent2", "/start_bent2")}
+        self.pending = []    # (service name, future)
+
+    def call(self, name: str) -> bool:
+        client = self.trigger_clients[name]
+        if not client.service_is_ready():
+            return False
+        self.pending.append((name, client.call_async(Trigger.Request())))
+        return True
+
+    def finished_calls(self):
+        done = [(n, f) for n, f in self.pending if f.done()]
+        self.pending = [(n, f) for n, f in self.pending if not f.done()]
+        return done
+
+
+class OrderWindow(QWidget):
+    def __init__(self, node: OrderNode):
+        super().__init__()
+        self.node = node
+        self.setWindowTitle("Product Order - bent 1")
+        self.resize(1100, 820)
+
+        # product types: picture grid + preview of the selected one
+        self.types = QListWidget()
+        self.types.setViewMode(QListView.IconMode)
+        self.types.setIconSize(QSize(96, 96))
+        self.types.setGridSize(QSize(118, 132))
+        self.types.setResizeMode(QListView.Adjust)
+        self.types.setMovement(QListView.Static)
+        self.types.setWordWrap(True)
+        for ptype in PRODUCT_TYPES:
+            item = QListWidgetItem(swatch(ptype), PRODUCT_TYPES[ptype]["label"])
+            item.setData(Qt.UserRole, ptype)
+            item.setToolTip(describe(ptype))
+            self.types.addItem(item)
+        self.types.itemDoubleClicked.connect(lambda _: self.add_selected())
+        self.types.currentItemChanged.connect(lambda *_: self.show_preview())
+        self.preview = QLabel()
+        self.preview.setFixedSize(180, 180)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("border: 1px solid #999;")
+        self.preview_text = QLabel("Select a product")
+        self.preview_text.setWordWrap(True)
+        reload_pics = QPushButton("Reload pictures")
+        reload_pics.clicked.connect(self.reload_pictures)
+        self.capture = QPushButton("Take pictures in Gazebo")
+        self.capture.setToolTip("Runs capture_product_images: each product is shown to the photo camera "
+                                "in the simulation and saved as its picture (Gazebo must be running).")
+        self.capture.clicked.connect(self.capture_pictures)
+        self.capture_proc = None
+        info = QVBoxLayout()
+        info.addWidget(self.preview_text)
+        info.addStretch(1)
+        info.addWidget(reload_pics)
+        info.addWidget(self.capture)
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(self.preview)
+        preview_row.addLayout(info, 1)
+        self.count = QSpinBox()
+        self.count.setRange(1, 20)
+        self.count.setPrefix("x ")
+        add = QPushButton("Add  >>")
+        add.clicked.connect(self.add_selected)
+        add_all = QPushButton("Add one of each")
+        add_all.clicked.connect(self.add_one_of_each)
+        left = QVBoxLayout()
+        left.addWidget(QLabel(f"{len(PRODUCT_TYPES)} product types (double-click to add)"))
+        left.addWidget(self.types, 1)
+        left.addLayout(preview_row)
+        row = QHBoxLayout()
+        row.addWidget(self.count)
+        row.addWidget(add)
+        row.addWidget(add_all)
+        left.addLayout(row)
+
+        # the order
+        self.order = QListWidget()
+        buttons = QHBoxLayout()
+        for text, slot in (("Up", lambda: self.move(-1)), ("Down", lambda: self.move(1)),
+                           ("Remove", self.remove_selected), ("Clear", self.clear_order)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            buttons.addWidget(b)
+        self.spacing = QDoubleSpinBox()
+        self.spacing.setRange(0.5, 5.0)
+        self.spacing.setSingleStep(0.1)
+        self.spacing.setValue(1.0)
+        self.spacing.setSuffix(" m")
+        self.offset = QDoubleSpinBox()
+        self.offset.setRange(0.5, 10.0)
+        self.offset.setSingleStep(0.1)
+        self.offset.setValue(1.5)
+        self.offset.setSuffix(" m")
+        self.clear_first = QCheckBox("Remove the products on bent 1 first")
+        self.clear_first.setChecked(True)
+        self.capacity = QLabel()
+        form = QFormLayout()
+        form.addRow("Distance between products", self.spacing)
+        form.addRow("First product before the station", self.offset)
+        form.addRow(self.clear_first)
+        form.addRow(self.capacity)
+        self.spawn = QPushButton("Spawn order on bent 1")
+        self.spawn.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.spawn.clicked.connect(self.spawn_order)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Order (top = first to reach the robot)"))
+        right.addWidget(self.order)
+        right.addLayout(buttons)
+        right.addLayout(form)
+        right.addWidget(self.spawn)
+
+        # conveyors
+        bents = QGroupBox("Conveyors")
+        grid = QHBoxLayout(bents)
+        for text, service in (("Stop bent 1", "/stop_bent1"), ("Start bent 1", "/start_bent1"),
+                              ("Stop bent 2", "/stop_bent2"), ("Start bent 2", "/start_bent2")):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _, s=service: self.call(s))
+            grid.addWidget(b)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(200)
+        self.log.setFixedHeight(110)
+
+        top = QHBoxLayout()
+        top.addLayout(left, 1)
+        top.addLayout(right, 1)
+        main = QVBoxLayout(self)
+        main.addLayout(top)
+        main.addWidget(bents)
+        main.addWidget(self.log)
+
+        self.spacing.valueChanged.connect(self.update_capacity)
+        self.offset.valueChanged.connect(self.update_capacity)
+        self.update_capacity()
+        self.order.setIconSize(QSize(32, 32))
+        self.types.setCurrentRow(0)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.spin_ros)
+        self.timer.start(50)
+
+    # pictures -------------------------------------------------------------------
+    def show_preview(self):
+        item = self.types.currentItem()
+        if item is None:
+            return
+        ptype = item.data(Qt.UserRole)
+        self.preview.setPixmap(picture(ptype).scaled(176, 176, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        t = PRODUCT_TYPES[ptype]
+        sx, sy, sz = t["size"]
+        size = {"box": f"{sx * 100:.0f} x {sy * 100:.0f} x {sz * 100:.0f} cm",
+                "cylinder": f"diameter {sx * 100:.0f} cm, height {sz * 100:.0f} cm",
+                "sphere": f"diameter {sx * 100:.0f} cm"}[t["shape"]]
+        self.preview_text.setText(f"<b>{t['label']}</b><br>type: {ptype}<br>shape: {t['shape']}<br>size: {size}")
+
+    def reload_pictures(self):
+        _pixmaps.clear()
+        for i in range(self.types.count()):
+            item = self.types.item(i)
+            item.setIcon(swatch(item.data(Qt.UserRole)))
+        for i in range(self.order.count()):
+            item = self.order.item(i)
+            item.setIcon(swatch(item.data(Qt.UserRole)))
+        self.show_preview()
+        self.say("Pictures reloaded from " + " | ".join(image_dirs()))
+
+    def capture_pictures(self):
+        if self.capture_proc is not None:
+            return
+        self.capture_proc = QProcess(self)
+        self.capture_proc.setProcessChannelMode(QProcess.MergedChannels)
+        self.capture_proc.readyReadStandardOutput.connect(
+            lambda: [self.say(line) for line in bytes(self.capture_proc.readAllStandardOutput()).decode(
+                errors="replace").splitlines() if line.strip()])
+        self.capture_proc.finished.connect(self.capture_finished)
+        self.capture.setEnabled(False)
+        self.say("Taking pictures in Gazebo (about 2 s per product) ...")
+        self.capture_proc.start("ros2", ["run", "factory_bringup", "capture_product_images"])
+
+    def capture_finished(self, *_):
+        self.capture_proc = None
+        self.capture.setEnabled(True)
+        self.reload_pictures()
+
+    # order list ---------------------------------------------------------------
+    def add_type(self, ptype: str, n: int = 1):
+        for _ in range(n):
+            item = QListWidgetItem(swatch(ptype), PRODUCT_TYPES[ptype]["label"])
+            item.setData(Qt.UserRole, ptype)
+            self.order.addItem(item)
+        self.update_capacity()
+
+    def add_selected(self):
+        item = self.types.currentItem()
+        if item is not None:
+            self.add_type(item.data(Qt.UserRole), self.count.value())
+
+    def add_one_of_each(self):
+        for ptype in PRODUCT_TYPES:
+            self.add_type(ptype)
+
+    def move(self, step: int):
+        row = self.order.currentRow()
+        if row < 0 or not 0 <= row + step < self.order.count():
+            return
+        item = self.order.takeItem(row)
+        self.order.insertItem(row + step, item)
+        self.order.setCurrentRow(row + step)
+
+    def remove_selected(self):
+        row = self.order.currentRow()
+        if row >= 0:
+            self.order.takeItem(row)
+        self.update_capacity()
+
+    def clear_order(self):
+        self.order.clear()
+        self.update_capacity()
+
+    def items(self):
+        return [self.order.item(i).data(Qt.UserRole) for i in range(self.order.count())]
+
+    def update_capacity(self):
+        cap = max_items(self.spacing.value(), self.offset.value(), RING1_RADIUS)
+        n = self.order.count()
+        self.capacity.setText(f"{n} in the order, at most {cap} fit at this distance")
+        self.capacity.setStyleSheet("color: #c0392b;" if n > cap else "")
+        self.spawn.setEnabled(0 < n <= cap)
+
+    # ROS ------------------------------------------------------------------------
+    def say(self, text: str):
+        self.log.appendPlainText(text)
+
+    def spawn_order(self):
+        order = {"items": self.items(), "spacing": self.spacing.value(),
+                 "start_offset": self.offset.value(), "clear": self.clear_first.isChecked()}
+        if self.node.count_subscribers("/spawn_order") == 0:
+            self.say("Nobody listens on /spawn_order: is bcr_endpoint_object_attacher running (rebuilt)?")
+            return
+        self.node.order_pub.publish(String(data=json.dumps(order)))
+        self.say(f"Sent order of {len(order['items'])} products, {order['spacing']:.2f} m apart ...")
+
+    def call(self, service: str):
+        if not self.node.call(service):
+            self.say(f"{service} is not available (is the attacher running?)")
+
+    def spin_ros(self):
+        rclpy.spin_once(self.node, timeout_sec=0.0)
+        for text in self.node.results:
+            try:
+                res = json.loads(text)
+                self.say(("OK: " if res.get("ok") else "FAILED: ") + res.get("message", ""))
+            except ValueError:
+                self.say(text)
+        self.node.results.clear()
+        for name, future in self.node.finished_calls():
+            res = future.result()
+            self.say(f"{name}: {res.message if res else 'no answer'}")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = OrderNode()
+    app = QApplication(sys.argv)
+    win = OrderWindow(node)
+    win.show()
+    try:
+        code = app.exec_()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

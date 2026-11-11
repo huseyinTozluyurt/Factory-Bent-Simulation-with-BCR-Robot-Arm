@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+Overhead camera geometry + OpenCV ring object detection (no ROS imports).
+
+Kept free of rclpy so it can be tested offline with a synthetic image.
+
+Camera model follows Gazebo's convention: the camera link looks along +x,
+image right is -y and image up is +z. The overhead_camera in
+dual_circular_factory_conveyor.sdf sits at (0, 0, 13) with pitch pi/2, so it
+looks straight down, image up = world +x and image right = world -y.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+
+def rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+@dataclass
+class OverheadCamera:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 13.0
+    roll: float = 0.0
+    pitch: float = 1.5708
+    yaw: float = 0.0
+    hfov: float = 1.55
+    width: int = 1280
+    height: int = 720
+
+    def __post_init__(self):
+        self.fx = (self.width / 2.0) / math.tan(self.hfov / 2.0)
+        self.fy = self.fx
+        self.cx = self.width / 2.0
+        self.cy = self.height / 2.0
+        self.R = rpy_to_matrix(self.roll, self.pitch, self.yaw)
+        self.C = np.array([self.x, self.y, self.z], dtype=float)
+
+    def pixel_to_world(self, u, v, plane_z: float):
+        """Intersect the pixel ray with the horizontal plane z = plane_z. Accepts arrays."""
+        u = np.asarray(u, dtype=float)
+        v = np.asarray(v, dtype=float)
+        ray_c = np.stack([np.ones_like(u), -(u - self.cx) / self.fx, -(v - self.cy) / self.fy], axis=-1)
+        ray_w = ray_c @ self.R.T
+        t = (plane_z - self.C[2]) / ray_w[..., 2]
+        wx = self.C[0] + t * ray_w[..., 0]
+        wy = self.C[1] + t * ray_w[..., 1]
+        return wx, wy
+
+    def world_to_pixel(self, x: float, y: float, z: float) -> Tuple[float, float]:
+        p = self.R.T @ (np.array([x, y, z], dtype=float) - self.C)
+        return self.cx - self.fx * p[1] / p[0], self.cy - self.fy * p[2] / p[0]
+
+
+@dataclass
+class Ring:
+    name: str
+    center_x: float
+    center_y: float
+    inner_radius: float
+    outer_radius: float
+
+
+@dataclass
+class DetectorParams:
+    belt_z: float = 1.375             # top surface of the belt (world z)
+    object_top_z: float = 1.60        # plane used to convert object pixels to world xy
+    blur_kernel: int = 5
+    gray_margin: int = 20             # object = brighter than the belt's median gray + margin
+    canny_low: int = 15
+    canny_high: int = 45
+    open_kernel_px: int = 3           # removes single-pixel noise and rail slivers
+    min_contrast: int = 8             # blob must be this much brighter than the belt on average (rejects shadows)
+    ignore_green_markers: bool = True # drop the green counting-gate strip that crosses the belt
+    close_kernel_px: int = 5
+    min_area_m2: float = 0.006
+    max_area_m2: float = 0.40
+    max_aspect_ratio: float = 4.5
+    min_solidity: float = 0.70
+
+
+@dataclass
+class Detection:
+    ring: str
+    x: float
+    y: float
+    yaw: float
+    size_x: float
+    size_y: float
+    area_m2: float
+    u: float
+    v: float
+    box_px: np.ndarray = field(repr=False, default=None)
+
+    def as_dict(self) -> Dict:
+        return {
+            "ring": self.ring, "x": round(self.x, 4), "y": round(self.y, 4),
+            "yaw": round(self.yaw, 4), "size_x": round(self.size_x, 3),
+            "size_y": round(self.size_y, 3), "area_m2": round(self.area_m2, 4),
+            "u": round(self.u, 1), "v": round(self.v, 1),
+        }
+
+
+class RingObjectDetector:
+    """Grayscale + Canny edges + contours, restricted to each ring's belt annulus."""
+
+    def __init__(self, camera: OverheadCamera, rings: List[Ring], params: DetectorParams):
+        self.camera = camera
+        self.rings = rings
+        self.params = params
+        self.ring_masks: Dict[str, np.ndarray] = {}
+        self.ring_masks_eroded: Dict[str, np.ndarray] = {}
+        self.belt_levels: Dict[str, float] = {}
+        self._build_ring_masks()
+
+    def _build_ring_masks(self):
+        cam = self.camera
+        uu, vv = np.meshgrid(np.arange(cam.width), np.arange(cam.height))
+        wx, wy = cam.pixel_to_world(uu, vv, self.params.belt_z)
+        for ring in self.rings:
+            r = np.hypot(wx - ring.center_x, wy - ring.center_y)
+            mask = ((r >= ring.inner_radius) & (r <= ring.outer_radius)).astype(np.uint8) * 255
+            self.ring_masks[ring.name] = mask
+            self.ring_masks_eroded[ring.name] = cv2.erode(mask, np.ones((7, 7), np.uint8))
+
+    def preprocess(self, bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Grayscale + blur, and Canny edges of the whole image."""
+        p = self.params
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        k = max(1, p.blur_kernel | 1)
+        blur = cv2.GaussianBlur(gray, (k, k), 0)
+        edges = cv2.Canny(blur, p.canny_low, p.canny_high)
+        return blur, edges
+
+    def green_marker_mask(self, bgr: np.ndarray) -> Optional[np.ndarray]:
+        """The counting gate is saturated green; no product on the belts is."""
+        if not self.params.ignore_green_markers:
+            return None
+        b, g, r = [c.astype(np.int16) for c in cv2.split(bgr)]
+        marker = ((g - r > 60) & (g - b > 60)).astype(np.uint8) * 255
+        return cv2.dilate(marker, np.ones((5, 5), np.uint8))
+
+    def ring_foreground(self, blur: np.ndarray, edges: np.ndarray, ring_name: str,
+                        marker: Optional[np.ndarray] = None) -> np.ndarray:
+        p = self.params
+        mask = self.ring_masks[ring_name]
+        inner = self.ring_masks_eroded[ring_name]
+
+        # 1) grayscale intensity: brighter than the (near black) belt. The belt level is the
+        #    median inside the ring, so lighting changes do not need a retuned threshold.
+        belt_level = float(np.median(blur[inner > 0])) if np.any(inner) else 0.0
+        self.belt_levels[ring_name] = belt_level
+        _, bright = cv2.threshold(blur, min(254.0, belt_level + p.gray_margin), 255, cv2.THRESH_BINARY)
+
+        # 2) edges inside the belt only (the belt's own borders are masked out), closed and
+        #    filled: catches dark objects whose brightness is close to the belt.
+        ring_edges = cv2.bitwise_and(edges, inner)
+        ring_edges = cv2.morphologyEx(ring_edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        edge_fill = np.zeros_like(ring_edges)
+        cnts, _ = cv2.findContours(ring_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(edge_fill, cnts, -1, 255, thickness=cv2.FILLED)
+
+        fg = cv2.bitwise_and(cv2.bitwise_or(bright, edge_fill), mask)
+        if marker is not None:
+            fg = cv2.bitwise_and(fg, cv2.bitwise_not(marker))
+        if p.open_kernel_px > 1:
+            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((p.open_kernel_px, p.open_kernel_px), np.uint8))
+        if p.close_kernel_px > 1:
+            fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((p.close_kernel_px, p.close_kernel_px), np.uint8))
+        return fg
+
+    def detect(self, bgr: np.ndarray, exclude_mask: Optional[np.ndarray] = None) -> Tuple[List[Detection], np.ndarray]:
+        """exclude_mask: pixels to ignore (the robot arm seen from above)."""
+        p = self.params
+        cam = self.camera
+        blur, edges = self.preprocess(bgr)
+        marker = self.green_marker_mask(bgr)
+        fg = np.zeros_like(blur)
+        detections: List[Detection] = []
+
+        for ring in self.rings:
+            ring_fg = self.ring_foreground(blur, edges, ring.name, marker)
+            if exclude_mask is not None:
+                ring_fg = cv2.bitwise_and(ring_fg, cv2.bitwise_not(exclude_mask))
+            fg = cv2.bitwise_or(fg, ring_fg)
+            cnts, _ = cv2.findContours(ring_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                if len(c) < 5:
+                    continue
+                rect = cv2.minAreaRect(c)
+                box = cv2.boxPoints(rect)
+                bx, by = cam.pixel_to_world(box[:, 0], box[:, 1], p.object_top_z)
+                side_a = math.hypot(bx[1] - bx[0], by[1] - by[0])
+                side_b = math.hypot(bx[2] - bx[1], by[2] - by[1])
+                area = side_a * side_b
+                if not (p.min_area_m2 <= area <= p.max_area_m2):
+                    continue
+                if max(side_a, side_b) / max(1e-6, min(side_a, side_b)) > p.max_aspect_ratio:
+                    continue
+                hull_area = cv2.contourArea(cv2.convexHull(c))
+                if hull_area <= 0 or cv2.contourArea(c) / hull_area < p.min_solidity:
+                    continue
+
+                blob = np.zeros_like(ring_fg)
+                cv2.drawContours(blob, [c], -1, 255, thickness=cv2.FILLED)
+                if cv2.mean(blur, mask=blob)[0] < self.belt_levels.get(ring.name, 0.0) + p.min_contrast:
+                    continue
+
+                m = cv2.moments(c)
+                if m["m00"] <= 0:
+                    continue
+                u, v = m["m10"] / m["m00"], m["m01"] / m["m00"]
+                wx, wy = cam.pixel_to_world(u, v, p.object_top_z)
+
+                # yaw of the long side, measured in the world frame
+                if side_a >= side_b:
+                    yaw = math.atan2(by[1] - by[0], bx[1] - bx[0])
+                    sx, sy = side_a, side_b
+                else:
+                    yaw = math.atan2(by[2] - by[1], bx[2] - bx[1])
+                    sx, sy = side_b, side_a
+                yaw = (yaw + math.pi / 2) % math.pi - math.pi / 2
+
+                detections.append(Detection(ring.name, float(wx), float(wy), yaw, sx, sy, area, u, v, box.astype(np.int32)))
+        return detections, fg
+
+    def draw(self, bgr: np.ndarray, detections: List[Detection], highlight: Optional[Tuple[float, float]] = None) -> np.ndarray:
+        out = bgr.copy()
+        for name, mask in self.ring_masks.items():
+            cnts, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(out, cnts, -1, (255, 200, 0), 1)
+        for d in detections:
+            color = (0, 255, 0) if d.ring == self.rings[0].name else (0, 200, 255)
+            cv2.drawContours(out, [d.box_px], 0, color, 2)
+            cv2.circle(out, (int(d.u), int(d.v)), 3, (0, 0, 255), -1)
+            cv2.putText(out, f"{d.ring} ({d.x:.2f},{d.y:.2f})", (int(d.u) + 6, int(d.v) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        if highlight is not None:
+            hu, hv = self.camera.world_to_pixel(highlight[0], highlight[1], self.params.object_top_z)
+            cv2.drawMarker(out, (int(hu), int(hv)), (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+        return out
+
+
+class RoiTracker:
+    """
+    Tracks one object approaching a catch station and decides when to catch it.
+
+    The track keeps a position and velocity. Each frame it is matched to the detection
+    nearest its predicted position; when nothing matches (the object is hidden under the
+    arm) the track coasts on its velocity for up to `coast_time` seconds. `trigger` turns
+    true when the object's closest approach to the station is within `roi_radius` and
+    happens within the next `latency` seconds (or it is already inside the ROI).
+    """
+
+    def __init__(self, station: Tuple[float, float], roi_radius: float, latency: float,
+                 max_speed: float = 1.5, watch_radius: float = 1.5, coast_time: float = 2.0,
+                 min_hits: int = 3):
+        self.station = station
+        self.roi_radius = roi_radius
+        self.latency = latency
+        self.max_speed = max_speed
+        self.watch_radius = watch_radius
+        self.coast_time = coast_time
+        self.min_hits = min_hits
+        self.reset()
+
+    def reset(self, ignore_for: float = 0.0, now: Optional[float] = None):
+        """Forget the current track. ignore_for: seconds during which nothing near the station starts a track."""
+        self.pos = None
+        self.pos_seen = None
+        self.vel = (0.0, 0.0)
+        self.t_last = None
+        self.t_seen = None
+        self.hits = 0
+        self.ignore_until = (now or 0.0) + ignore_for if ignore_for > 0 else None
+
+    def _dist(self, a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def update(self, stamp: float, objects: List[Tuple[float, float]]) -> Dict:
+        sx, sy = self.station
+        if self.ignore_until is not None and stamp < self.ignore_until:
+            objects = [o for o in objects if self._dist(o, self.station) > self.roi_radius * 1.5]
+
+        coasting = False
+        if self.pos is not None:
+            dt = max(0.0, stamp - self.t_last)
+            pred = (self.pos[0] + self.vel[0] * dt, self.pos[1] + self.vel[1] * dt)
+            gate = 0.10 + self.max_speed * dt * 0.5
+            near = [o for o in objects if self._dist(o, pred) <= gate]
+            if near:
+                m = min(near, key=lambda o: self._dist(o, pred))
+                if dt > 1e-3 and self.t_seen is not None:
+                    span = stamp - self.t_seen
+                    meas = ((m[0] - self.pos_seen[0]) / span, (m[1] - self.pos_seen[1]) / span) if span > 1e-3 else self.vel
+                    a = 0.5 if self.hits > 1 else 1.0
+                    self.vel = (a * meas[0] + (1 - a) * self.vel[0], a * meas[1] + (1 - a) * self.vel[1])
+                self.pos, self.pos_seen, self.t_seen = m, m, stamp
+                self.hits += 1
+            else:
+                self.pos = pred
+                coasting = True
+            self.t_last = stamp
+            # drop a track that has been hidden too long or has gone past and away from the station
+            if (self.t_seen is not None and stamp - self.t_seen > self.coast_time) or \
+                    self._dist(self.pos, self.station) > self.watch_radius * 1.2:
+                self.pos = None
+
+        if self.pos is None:
+            cands = [o for o in objects if self._dist(o, self.station) <= self.watch_radius]
+            self.vel, self.hits = (0.0, 0.0), 0
+            if cands:
+                m = min(cands, key=lambda o: self._dist(o, self.station))
+                self.pos, self.pos_seen, self.t_seen, self.t_last, self.hits = m, m, stamp, stamp, 1
+
+        state = {"nearest": None, "dist": None, "velocity": (0.0, 0.0), "pred": None, "pred_dist": None,
+                 "time_to_closest": None, "coasting": coasting, "trigger": False}
+        if self.pos is None:
+            return state
+
+        vx, vy = self.vel
+        px, py = self.pos
+        v2 = vx * vx + vy * vy
+        t_star = max(0.0, ((sx - px) * vx + (sy - py) * vy) / v2) if v2 > 1e-4 else 0.0
+        cx, cy = px + vx * t_star, py + vy * t_star
+        closest = math.hypot(cx - sx, cy - sy)
+        dist = math.hypot(px - sx, py - sy)
+        lead = min(t_star, self.latency)
+        state.update(
+            nearest=(px, py), dist=dist, velocity=(vx, vy),
+            pred=(px + vx * lead, py + vy * lead), pred_dist=closest, time_to_closest=t_star,
+        )
+        ready = self.hits >= self.min_hits
+        state["trigger"] = ready and (dist <= self.roi_radius or (closest <= self.roi_radius and t_star <= self.latency))
+        return state
+
+
+def arm_mask_from_points(camera: OverheadCamera, points: List[Tuple[float, float, float]], width_m: float) -> np.ndarray:
+    """Pixels covered by the arm seen from the overhead camera: a thick polyline through its link frames."""
+    mask = np.zeros((camera.height, camera.width), np.uint8)
+    pix = []
+    for x, y, z in points:
+        u, v = camera.world_to_pixel(x, y, z)
+        depth = max(0.5, camera.z - z)
+        pix.append(((int(round(u)), int(round(v))), max(2, int(round(width_m * camera.fx / depth)))))
+    for (a, wa), (b, wb) in zip(pix, pix[1:]):
+        cv2.line(mask, a, b, 255, thickness=max(wa, wb))
+    for c, w in pix:
+        cv2.circle(mask, c, w // 2 + 1, 255, -1)
+    return mask
+
+
+def compose_detection_view(detector: RingObjectDetector, bgr: np.ndarray, detections: List[Detection],
+                           roi: Optional[Dict] = None, status: str = "",
+                           arm_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    The live "Object Detection" window: annotated camera image, ROI circle around the
+    catch station with the tracked object, its velocity and predicted point, a zoomed
+    inset of the station, and grayscale / Canny thumbnails of the pipeline.
+    """
+    cam, z = detector.camera, detector.params.object_top_z
+    out = detector.draw(bgr, detections)
+    h, w = out.shape[:2]
+    if arm_mask is not None:
+        tint = out.copy()
+        tint[arm_mask > 0] = (255, 120, 0)
+        out = cv2.addWeighted(tint, 0.35, out, 0.65, 0)
+
+    def px(x, y):
+        u, v = cam.world_to_pixel(x, y, z)
+        return int(round(u)), int(round(v))
+
+    zoom_center = None
+    if roi and roi.get("station"):
+        sx, sy = roi["station"]
+        r = float(roi.get("roi_radius", 0.3))
+        c = px(sx, sy)
+        r_px = max(2, int(round(math.hypot(*np.subtract(px(sx + r, sy), c)))))
+        trig = bool(roi.get("trigger"))
+        roi_color = (0, 0, 255) if trig else (0, 220, 255)
+        cv2.circle(out, c, r_px, roi_color, 2)
+        cv2.drawMarker(out, c, roi_color, cv2.MARKER_TILTED_CROSS, 10, 1)
+        if roi.get("nearest"):
+            n = px(*roi["nearest"])
+            cv2.circle(out, n, 6, (255, 0, 255), 2)
+            if roi.get("pred"):
+                cv2.arrowedLine(out, n, px(*roi["pred"]), (255, 0, 255), 2, tipLength=0.4)
+        zoom_center = c
+
+        label = "CATCH!" if trig else (f"tracking: {roi['dist']:.2f} m" if roi.get("dist") is not None else "waiting")
+        if roi.get("coasting"):
+            label += " (hidden, predicted)"
+        cv2.putText(out, f"ROI {label}", (c[0] + r_px + 6, c[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_color, 2, cv2.LINE_AA)
+
+    # zoomed inset around the station (objects are only ~20 px wide in the full view)
+    if zoom_center is not None:
+        half = 40
+        x0, y0 = max(0, zoom_center[0] - half), max(0, zoom_center[1] - half)
+        crop = out[y0:min(h, zoom_center[1] + half), x0:min(w, zoom_center[0] + half)]
+        if crop.size:
+            inset = cv2.resize(crop, (240, 240), interpolation=cv2.INTER_NEAREST)
+            out[10:250, w - 250:w - 10] = inset
+            cv2.rectangle(out, (w - 251, 9), (w - 9, 251), (255, 255, 255), 1)
+            cv2.putText(out, "station zoom x3", (w - 246, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # pipeline thumbnails: grayscale and Canny edges
+    blur, edges = detector.preprocess(bgr)
+    tw, th = 256, 144
+    for i, (img, name) in enumerate(((blur, "grayscale"), (edges, "canny edges"))):
+        thumb = cv2.cvtColor(cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA), cv2.COLOR_GRAY2BGR)
+        y = h - (th + 10) * (i + 1)
+        out[y:y + th, 10:10 + tw] = thumb
+        cv2.rectangle(out, (9, y - 1), (11 + tw, y + th), (255, 255, 255), 1)
+        cv2.putText(out, name, (14, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    n1 = sum(1 for d in detections if d.ring == detector.rings[0].name)
+    header = f"{detector.rings[0].name}: {n1}  {detector.rings[1].name}: {len(detections) - n1}"
+    cv2.rectangle(out, (0, 0), (w - 262, 26), (0, 0, 0), -1)
+    cv2.putText(out, f"{header}   {status[:90]}", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return out

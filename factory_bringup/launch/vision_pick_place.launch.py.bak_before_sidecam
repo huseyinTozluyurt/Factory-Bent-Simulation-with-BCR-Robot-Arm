@@ -1,0 +1,110 @@
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+def generate_launch_description():
+    auto_start = LaunchConfiguration("auto_start")
+    loop = LaunchConfiguration("loop")
+    dry_run = LaunchConfiguration("dry_run")
+    mode = LaunchConfiguration("mode")
+    show_window = LaunchConfiguration("show_window")
+
+    return LaunchDescription([
+        DeclareLaunchArgument("mode", default_value="station",
+                              description="station: wait over ring 1 and catch passing products; "
+                                          "pick_zone: pick a still object near the arm."),
+        DeclareLaunchArgument("auto_start", default_value="true",
+                              description="Start as soon as the nodes are up (false: wait for /vision_pick_place/start)."),
+        DeclareLaunchArgument("loop", default_value="true",
+                              description="Keep catching objects until /vision_pick_place/stop."),
+        DeclareLaunchArgument("show_window", default_value="true",
+                              description="Open the live 'Object Detection' window."),
+        DeclareLaunchArgument("dry_run", default_value="false",
+                              description="Detect and solve IK, log the joint goals, but do not move the arm."),
+
+        Node(
+            package="factory_bringup",
+            executable="ring_object_detector",
+            name="ring_object_detector",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "use_sim_time": True,
+                "image_topic": "/overhead_camera/image",
+                "show_window": ParameterValue(show_window, value_type=bool),
+
+                # <model name="overhead_camera"> in dual_circular_factory_conveyor.sdf
+                "camera_x": 0.0,
+                "camera_y": 0.0,
+                "camera_z": 13.0,
+                "camera_pitch": 1.5708,
+                "camera_hfov": 1.55,
+
+                # ring 1 = left bent (pick), ring 2 = right bent (place); belt r = 2.95..4.05, search only the product lane
+                "ring1_center_x": -6.0,
+                "ring2_center_x": 6.0,
+                "ring_inner_radius": 3.10,
+                "ring_outer_radius": 3.75,
+                "belt_z": 1.375,
+                "object_top_z": 1.60,
+
+                "gray_margin": 20,
+                "canny_low": 15,
+                "canny_high": 45,
+                "min_area_m2": 0.006,
+                "max_area_m2": 0.40,
+            }],
+        ),
+
+        Node(
+            package="factory_bringup",
+            executable="vision_pick_place",
+            name="vision_pick_place",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "use_sim_time": True,
+                "mode": mode,
+                "auto_start": ParameterValue(auto_start, value_type=bool),
+                "loop": ParameterValue(loop, value_type=bool),
+                "dry_run": ParameterValue(dry_run, value_type=bool),
+
+                # base_* / object_height / endpoint_frame are read from the attacher at start.
+                "sync_from_attacher": True,
+
+                # station mode: hover over the product path (r = 3.42 around (-6, 0)) nearest the arm
+                "station_x": -2.58,
+                "station_y": 0.0,
+                "hover_z": 2.0,
+                "roi_radius": 0.30,
+                "catch_latency": 0.35,      # attach delay the vision prediction compensates for
+
+                "pick_zone_x": -2.45,
+                "pick_zone_y": 0.0,
+                "pick_zone_radius": 0.9,
+                "pick_surface_z": 1.375,
+                "stable_frames": 5,
+                "stable_tolerance": 0.03,
+
+                "place_x": 2.45,
+                "place_y": 0.0,
+                "place_slots": 3,
+                "place_slot_spacing": 0.3,
+                "place_surface_z": 1.375,
+                "place_tip_height": 0.47,
+                "place_drop_clearance": 0.03,
+
+                "approach_height": 0.25,
+                "ik_tolerance": 0.05,
+                "transit_pose": [0.0, 0.45, 0.0, -0.65, 0.0, 0.35, 0.0],
+                "pick_seed": [1.30, -0.75, 0.0, -0.80, 0.0, -1.20, 0.0],
+                # arm speed: seconds per short move / per swing between the bents
+                "move_duration": 1.0,
+                "swing_duration": 2.0,
+                "settle_timeout_sec": 1.5,
+            }],
+        ),
+    ])

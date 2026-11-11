@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""
+Vision Pick and Place - BCR arm moves objects from ring 1 (left bent) to ring 2 (right bent).
+
+Uses:
+  /vision/ring1_objects, /vision/ring2_objects   from ring_object_detector
+  /joint_states, /robot_description               from the BCR arm launch
+  /joint_trajectory_controller/joint_trajectory   arm command (same as the UI)
+  /attach_object_to_endpoint, /release_object_from_endpoint  from bcr_endpoint_object_attacher
+
+mode "station" (default): catch moving products
+  move the gripper over the catch station (the middle of the ring 1 section nearest
+  the arm) and stop there -> the overhead camera tracks the objects coming along the
+  bent -> with use_side_camera (default) the side camera must see an object standing on
+  the belt at the station where the overhead camera has a track (cross-check) -> the
+  product is stopped on the bent (/hold_object_for_pick) -> the arm comes down onto its
+  top (height from the side camera) -> attach -> lift -> place it on ring 2 at the next
+  free slot -> back to the station. Without the side camera it attaches from the hover
+  point when the overhead camera predicts the object inside the ROI circle.
+
+mode "pick_zone": pick a still object
+  wait for an object that has been still for `stable_frames` frames inside the pick
+  zone -> IK approach/contact -> attach -> lift -> place on ring 2.
+
+Services:
+  /vision_pick_place/start   std_srvs/Trigger  run (one catch, or keep going if loop:=true)
+  /vision_pick_place/stop    std_srvs/Trigger  stop after the current motion
+Topics:
+  /vision_pick_place/status  std_msgs/String   each step of the cycle
+  /vision_pick_place/roi     std_msgs/String   JSON tracking state, drawn by the detector window
+  /vision_pick_place/cross_check std_msgs/String JSON top/side camera verdict, drawn by the side window
+"""
+
+import json
+import math
+import threading
+import time
+from collections import deque
+from typing import Dict, List, Optional, Tuple
+
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import PoseArray
+from rcl_interfaces.msg import Parameter as ParameterMsg
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.msg import ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+from sensor_msgs.msg import JointState
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from factory_bringup.urdf_ik import UrdfChain
+from factory_bringup.vision_geometry import RoiTracker
+
+ATTACHER_NODE = "/bcr_endpoint_object_attacher"
+
+
+class StopRequested(Exception):
+    pass
+
+
+class VisionPickPlace(Node):
+    def __init__(self):
+        super().__init__("vision_pick_place")
+        cb = ReentrantCallbackGroup()
+
+        self.declare_parameter("mode", "station")
+        self.declare_parameter("joint_names", [f"joint{i}" for i in range(1, 8)])
+        self.declare_parameter("controller_topic", "/joint_trajectory_controller/joint_trajectory")
+
+        # Arm base in the world. Same meaning as in the attacher; synced from it when available.
+        self.declare_parameter("sync_from_attacher", True)
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("endpoint_frame", "gripper_tip")
+        self.declare_parameter("base_x", -0.200)
+        self.declare_parameter("base_y", -0.154)
+        self.declare_parameter("base_z", -0.508)
+        self.declare_parameter("base_yaw", 0.0)
+        self.declare_parameter("object_height", 0.26)
+        self.declare_parameter("contact_gap", 0.005)
+
+        # Station mode: products orbit ring 1 at r = 3.42 around (-6, 0); the point of that
+        # path nearest the arm is (-2.58, 0). The gripper hovers above the tallest product.
+        self.declare_parameter("station_x", -2.58)
+        self.declare_parameter("station_y", 0.0)
+        self.declare_parameter("hover_z", 2.0)
+        self.declare_parameter("roi_radius", 0.30)
+        self.declare_parameter("catch_latency", 0.35)
+        self.declare_parameter("track_max_speed", 1.5)
+        # keep predicting an object hidden under the arm; at 0.24 m/s it is hidden for up to ~4 s
+        self.declare_parameter("track_coast_time", 5.0)
+        self.declare_parameter("max_failed_catches", 5)    # consecutive failures before giving up
+        self.declare_parameter("enable_attacher_auto_select", True)
+
+        # Two-camera cross-check, then stop the product and come down onto it.
+        self.declare_parameter("use_side_camera", True)
+        self.declare_parameter("side_check_topic", "/vision/side_check")
+        self.declare_parameter("side_fresh_sec", 0.5)       # side result older than this is ignored
+        self.declare_parameter("catch_window", 0.25)        # side camera y must be this close to station_y
+        self.declare_parameter("cross_check_tol", 0.20)     # top camera track must be this close to the side estimate
+        self.declare_parameter("side_confirm_timeout", 2.0) # top camera trigger with no side object -> skip it
+        self.declare_parameter("cross_check_cooldown", 1.5)
+        self.declare_parameter("ring1_center_x", -6.0)
+        self.declare_parameter("ring1_center_y", 0.0)
+        self.declare_parameter("product_path_radius", 3.42) # products ride this circle; gives x from the side camera's y
+        self.declare_parameter("descend_gap", 0.02)         # tip stops this far above the product top before attach
+        self.declare_parameter("descend_xy_tol", 0.10)      # vision vs held product position
+        self.declare_parameter("descend_z_tol", 0.08)       # side camera top vs held product top
+        self.declare_parameter("descend_duration", 0.8)
+
+        # Carry: small lift straight up from the grab, then one smooth swing of the whole arm
+        # (mostly joint1) round to the ring 2 approach, turning the way swing_direction says.
+        self.declare_parameter("lift_height", 0.50)          # m up from the grab before swinging
+        self.declare_parameter("lift_max_z", 2.35)           # tip z cap (arm reach over ring 1 ends near 2.4 m)
+        # The lift right after the grab turns only this joint (joint2 = shoulder: ~2.3 m of tip
+        # height per rad here, about twice the elbow); "ik" = move all joints straight up instead.
+        self.declare_parameter("lift_joint", "joint2")
+        self.declare_parameter("lift_max_joint_delta", 0.6)  # rad
+        self.declare_parameter("swing_direction", "left")    # left = counter-clockwise seen from above
+        self.declare_parameter("carry_swing_duration", 3.0)  # s for the swing while carrying
+        self.declare_parameter("release_settle_sec", 0.6)    # let the carried object catch up before release
+
+        # Pick-zone mode: only still objects on ring 1 inside this circle.
+        self.declare_parameter("pick_zone_x", -2.45)
+        self.declare_parameter("pick_zone_y", 0.0)
+        self.declare_parameter("pick_zone_radius", 0.9)
+        self.declare_parameter("pick_surface_z", 1.375)
+        self.declare_parameter("stable_frames", 5)
+        self.declare_parameter("stable_tolerance", 0.03)
+        self.declare_parameter("detection_timeout_sec", 30.0)
+
+        # Place on ring 2: slot 0 at (place_x, place_y), further slots spread along the ring arc.
+        # slot 0 = the place point Hueseyin picked on ring 2 (on the belt, well inside the reach)
+        self.declare_parameter("place_x", 2.2171)
+        self.declare_parameter("place_y", -0.3736)
+        self.declare_parameter("place_yaw", -1.2781)       # object yaw on ring 2 at slot 0 (other slots turn with the ring)
+        self.declare_parameter("place_exact", True)        # put the object down exactly on the slot point, resting on the belt
+        self.declare_parameter("ring2_center_x", 6.0)
+        self.declare_parameter("ring2_center_y", 0.0)
+        self.declare_parameter("place_slot_spacing", 0.3)
+        self.declare_parameter("place_slots", 1)           # ring 2 moves now: always the same release zone
+
+        # Release zone on ring 2: wait next to it (place_wait_offset m before it along the swing)
+        # until the release camera sees it empty, stop ring 2, put the object down, restart ring 2.
+        self.declare_parameter("use_release_camera", True)
+        self.declare_parameter("release_zone_topic", "/vision/release_zone")
+        self.declare_parameter("place_wait_offset", 0.8)
+        self.declare_parameter("release_zone_clear_frames", 3)  # empty in this many frames in a row
+        self.declare_parameter("stop_ring2_for_release", True)
+        self.declare_parameter("place_surface_z", 1.375)
+        self.declare_parameter("place_tip_height", 0.47)   # tip above the belt at release (tallest product 0.42 m)
+        self.declare_parameter("place_drop_clearance", 0.03)
+        self.declare_parameter("place_approach_height", 0.12)
+        self.declare_parameter("verify_place", True)
+        self.declare_parameter("verify_radius", 0.5)
+
+        self.declare_parameter("approach_height", 0.25)
+        self.declare_parameter("ik_tolerance", 0.05)
+        self.declare_parameter("transit_pose", [0.0, 0.45, 0.0, -0.65, 0.0, 0.35, 0.0])
+        self.declare_parameter("pick_seed", [1.30, -0.75, 0.0, -0.80, 0.0, -1.20, 0.0])
+        self.declare_parameter("move_duration", 1.0)       # short moves (approach, contact, lift)
+        self.declare_parameter("swing_duration", 2.0)      # long moves between the two bents
+        self.declare_parameter("joint_tolerance", 0.05)
+        self.declare_parameter("settle_timeout_sec", 1.5)
+
+        self.declare_parameter("auto_start", True)
+        self.declare_parameter("loop", True)
+        self.declare_parameter("dry_run", False)
+
+        self.joint_positions: Dict[str, float] = {}
+        self.robot_description: Optional[str] = None
+        self.chain: Optional[UrdfChain] = None
+        self.ring1_history: deque = deque(maxlen=50)
+        self.ring1_event = threading.Event()
+        self.ring2_latest: List[Tuple[float, float]] = []
+        self.tracker: Optional[RoiTracker] = None
+        self.roi_state: Dict = {}
+        self.side_state: Dict = {}
+        self.zone_state: Dict = {}
+        self.holding = False
+        self.busy = False
+        self.stop_flag = False
+        self.place_count = 0
+        self.place_solutions: Dict[int, Tuple[List[float], List[float]]] = {}
+        self.last_cmd: Optional[List[float]] = None
+
+        self.traj_pub = self.create_publisher(JointTrajectory, self.p("controller_topic"), 10)
+        self.status_pub = self.create_publisher(String, "/vision_pick_place/status", 10)
+        self.roi_pub = self.create_publisher(String, "/vision_pick_place/roi", 10)
+        self.cross_pub = self.create_publisher(String, "/vision_pick_place/cross_check", 10)
+
+        self.create_subscription(JointState, "/joint_states", self.on_joint_state, 20, callback_group=cb)
+        self.create_subscription(PoseArray, "/vision/ring1_objects", self.on_ring1, 10, callback_group=cb)
+        self.create_subscription(PoseArray, "/vision/ring2_objects", self.on_ring2, 10, callback_group=cb)
+        self.create_subscription(String, self.p("side_check_topic"), self.on_side_check, 10, callback_group=cb)
+        self.create_subscription(String, self.p("release_zone_topic"), self.on_release_zone, 10, callback_group=cb)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
+        self.create_subscription(String, "/robot_description", self.on_robot_description, latched, callback_group=cb)
+
+        self.attach_client = self.create_client(Trigger, "/attach_object_to_endpoint", callback_group=cb)
+        self.release_client = self.create_client(Trigger, "/release_object_from_endpoint", callback_group=cb)
+        self.hold_client = self.create_client(Trigger, "/hold_object_for_pick", callback_group=cb)
+        self.stop_bent_client = self.create_client(Trigger, "/stop_bent", callback_group=cb)
+        self.start_bent_client = self.create_client(Trigger, "/start_bent", callback_group=cb)
+        self.stop_bent2_client = self.create_client(Trigger, "/stop_bent2", callback_group=cb)
+        self.start_bent2_client = self.create_client(Trigger, "/start_bent2", callback_group=cb)
+        self.resume_client = self.create_client(Trigger, "/resume_held_object", callback_group=cb)
+        self.attacher_params_client = self.create_client(GetParameters, f"{ATTACHER_NODE}/get_parameters", callback_group=cb)
+        self.attacher_set_client = self.create_client(SetParameters, f"{ATTACHER_NODE}/set_parameters", callback_group=cb)
+        self.rsp_params_client = self.create_client(GetParameters, "/robot_state_publisher/get_parameters", callback_group=cb)
+
+        self.create_service(Trigger, "/vision_pick_place/start", self.on_start, callback_group=cb)
+        self.create_service(Trigger, "/vision_pick_place/stop", self.on_stop, callback_group=cb)
+
+        if self.p("auto_start"):
+            self.start_worker()
+            self.get_logger().info("Vision pick-and-place ready, starting now (auto_start).")
+        else:
+            self.get_logger().info("Vision pick-and-place ready. Call /vision_pick_place/start to run.")
+
+    # ------------------------------------------------------------------ helpers
+    def p(self, name):
+        return self.get_parameter(name).value
+
+    def status(self, text: str, warn: bool = False):
+        # rclpy forbids two severities from one call site, so keep them on separate lines
+        if warn:
+            self.get_logger().warning(text)
+        else:
+            self.get_logger().info(text)
+        self.status_pub.publish(String(data=text))
+
+    def check_stop(self):
+        if self.stop_flag:
+            raise StopRequested()
+
+    def wait_future(self, future, timeout: float):
+        end = time.time() + timeout
+        while not future.done():
+            if time.time() > end:
+                return None
+            time.sleep(0.01)
+        return future.result()
+
+    # ---------------------------------------------------------------- callbacks
+    def on_joint_state(self, msg: JointState):
+        for n, pos in zip(msg.name, msg.position):
+            self.joint_positions[n] = float(pos)
+
+    def on_ring1(self, msg: PoseArray):
+        objs = [(ps.position.x, ps.position.y) for ps in msg.poses]
+        self.ring1_history.append((time.time(), objs))
+        if self.tracker is not None:
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            self.roi_state = self.tracker.update(stamp, objs)
+            self.roi_pub.publish(String(data=json.dumps({
+                "station": self.tracker.station, "roi_radius": self.tracker.roi_radius,
+                **{k: v for k, v in self.roi_state.items()},
+            })))
+        self.ring1_event.set()
+
+    def on_ring2(self, msg: PoseArray):
+        self.ring2_latest = [(ps.position.x, ps.position.y) for ps in msg.poses]
+
+    def on_side_check(self, msg: String):
+        try:
+            state = json.loads(msg.data)
+        except ValueError:
+            return
+        state["_rx"] = time.time()
+        self.side_state = state
+
+    def on_release_zone(self, msg: String):
+        try:
+            state = json.loads(msg.data)
+        except ValueError:
+            return
+        state["_rx"] = time.time()
+        self.zone_state = state
+
+    def on_robot_description(self, msg: String):
+        self.robot_description = msg.data
+
+    def on_start(self, request, response):
+        if self.busy:
+            response.success, response.message = False, "Already running."
+            return response
+        self.start_worker()
+        response.success, response.message = True, "Pick-and-place started."
+        return response
+
+    def on_stop(self, request, response):
+        self.stop_flag = True
+        response.success, response.message = True, "Stop requested."
+        return response
+
+    def start_worker(self):
+        self.stop_flag = False
+        self.busy = True
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    # ------------------------------------------------------------------- setup
+    def sync_from_attacher(self):
+        if not self.p("sync_from_attacher"):
+            return
+        if not self.attacher_params_client.wait_for_service(timeout_sec=2.0):
+            self.status("Attacher parameters not reachable; using this node's base_* parameters.", warn=True)
+            return
+        names = ["base_x", "base_y", "base_z", "base_yaw", "object_size_z", "contact_gap", "base_frame", "endpoint_frame"]
+        req = GetParameters.Request()
+        req.names = names
+        res = self.wait_future(self.attacher_params_client.call_async(req), 3.0)
+        if res is None:
+            return
+        updates = []
+        for name, val in zip(names, res.values):
+            if val.type == ParameterType.PARAMETER_NOT_SET:
+                continue
+            target = "object_height" if name == "object_size_z" else name
+            value = val.string_value if name.endswith("frame") else val.double_value
+            updates.append(Parameter(target, value=value))
+        self.set_parameters(updates)
+        self.status(
+            f"Synced from attacher: base=({self.p('base_x'):.3f}, {self.p('base_y'):.3f}, {self.p('base_z'):.3f}, "
+            f"yaw {self.p('base_yaw'):.3f}), endpoint={self.p('endpoint_frame')}"
+        )
+
+    def set_attacher_params(self, params: Dict[str, object]):
+        if not self.attacher_set_client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("Attacher not running. Launch bcr_endpoint_object_attacher first.")
+        msgs = []
+        for name, value in params.items():
+            if isinstance(value, bool):
+                pv = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=value)
+            else:
+                pv = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(value))
+            msgs.append(ParameterMsg(name=name, value=pv))
+        req = SetParameters.Request()
+        req.parameters = msgs
+        res = self.wait_future(self.attacher_set_client.call_async(req), 3.0)
+        if res is None or not res.results or not all(r.successful for r in res.results):
+            raise RuntimeError(f"Could not set {list(params)} on the attacher (rebuild so it is the V2.9 attacher).")
+
+    def ensure_chain(self):
+        if self.chain is not None:
+            return
+        end = time.time() + 5.0
+        while self.robot_description is None and time.time() < end:
+            time.sleep(0.1)
+        if self.robot_description is None and self.rsp_params_client.wait_for_service(timeout_sec=2.0):
+            req = GetParameters.Request()
+            req.names = ["robot_description"]
+            res = self.wait_future(self.rsp_params_client.call_async(req), 3.0)
+            if res is not None and res.values:
+                self.robot_description = res.values[0].string_value
+        if not self.robot_description:
+            raise RuntimeError("No robot_description (topic or robot_state_publisher parameter). Is the arm launched?")
+        self.chain = UrdfChain(self.robot_description, self.p("base_frame"), self.p("endpoint_frame"))
+        missing = [n for n in self.p("joint_names") if n not in self.chain.names]
+        self.status(f"Kinematic chain {self.p('base_frame')} -> {self.p('endpoint_frame')}: {self.chain.names}"
+                    + (f" (not in chain: {missing})" if missing else ""))
+
+    # --------------------------------------------------------------- geometry
+    def world_to_base(self, x, y, z):
+        dx, dy, dz = x - self.p("base_x"), y - self.p("base_y"), z - self.p("base_z")
+        c, s = math.cos(-self.p("base_yaw")), math.sin(-self.p("base_yaw"))
+        return c * dx - s * dy, s * dx + c * dy, dz
+
+    def solve_ik(self, world_xyz, seeds: List[List[float]], label: str) -> List[float]:
+        names = list(self.p("joint_names"))
+        bx, by, bz = self.world_to_base(*world_xyz)
+        seed_dicts = [dict(zip(names, s)) for s in seeds]
+        fixed = {n: v for n, v in self.joint_positions.items() if n not in names}
+        q, err = self.chain.solve_position((bx, by, bz), seed_dicts, active=names, fixed=fixed)
+        if err > self.p("ik_tolerance"):
+            # near the edge of the reach: retry from postures facing the target from several sides
+            bearing = math.atan2(by, bx)
+            extra = []
+            for j1 in (bearing + math.pi / 2, bearing - math.pi / 2, bearing, bearing + math.pi):
+                for j2 in (-0.75, 0.75):
+                    seed = list(self.p("pick_seed"))
+                    seed[0], seed[1] = math.atan2(math.sin(j1), math.cos(j1)), j2
+                    extra.append(dict(zip(names, seed)))
+            q2, err2 = self.chain.solve_position((bx, by, bz), extra, active=names, fixed=fixed)
+            if err2 < err:
+                q, err = q2, err2
+        sol = [q.get(n, 0.0) for n in names]
+        self.get_logger().info(
+            f"IK {label}: world=({world_xyz[0]:.3f}, {world_xyz[1]:.3f}, {world_xyz[2]:.3f}) "
+            f"err={err * 1000:.1f} mm q={[round(v, 3) for v in sol]}"
+        )
+        if err > self.p("ik_tolerance"):
+            raise RuntimeError(
+                f"IK for {label} misses by {err:.3f} m (> ik_tolerance {self.p('ik_tolerance')}). "
+                f"Target may be out of reach; adjust station_*/pick_zone_*/place_* or base_* parameters."
+            )
+        return sol
+
+    def rotated_seed(self, seed: List[float], from_xy, to_xy) -> List[float]:
+        """Same posture, with joint1 turned by the base-frame bearing change between two targets."""
+        a = math.atan2(self.world_to_base(*from_xy, 0.0)[1], self.world_to_base(*from_xy, 0.0)[0])
+        b = math.atan2(self.world_to_base(*to_xy, 0.0)[1], self.world_to_base(*to_xy, 0.0)[0])
+        out = list(seed)
+        out[0] = math.atan2(math.sin(seed[0] + b - a), math.cos(seed[0] + b - a))
+        return out
+
+    def place_point(self, slot: int) -> Tuple[float, float]:
+        """Slot 0 is (place_x, place_y); others alternate either side of it along the ring 2 arc."""
+        cx, cy = self.p("ring2_center_x"), self.p("ring2_center_y")
+        px, py = self.p("place_x"), self.p("place_y")
+        r = math.hypot(px - cx, py - cy)
+        n = max(1, int(self.p("place_slots")))
+        k = slot % n
+        offset = (k + 1) // 2 * (1 if k % 2 else -1)
+        a = math.atan2(py - cy, px - cx) + offset * self.p("place_slot_spacing") / max(r, 1e-6)
+        return cx + r * math.cos(a), cy + r * math.sin(a)
+
+    # ------------------------------------------------------------------ motion
+    def current_vector(self) -> List[float]:
+        return [self.joint_positions.get(n, 0.0) for n in self.p("joint_names")]
+
+    def move(self, positions: List[float], duration: float, label: str):
+        self.check_stop()
+        self.status(f"MOVE {label}: {[round(v, 3) for v in positions]} in {duration:.1f}s")
+        self.last_cmd = list(positions)
+        if self.p("dry_run"):
+            return
+        traj = JointTrajectory()
+        traj.joint_names = list(self.p("joint_names"))
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in positions]
+        pt.time_from_start.sec = int(duration)
+        pt.time_from_start.nanosec = int((duration - int(duration)) * 1e9)
+        traj.points.append(pt)
+        self.traj_pub.publish(traj)
+
+        end = time.time() + duration + self.p("settle_timeout_sec")
+        time.sleep(duration * 0.7)
+        while time.time() < end:
+            err = max(abs(a - b) for a, b in zip(self.current_vector(), positions))
+            if err < self.p("joint_tolerance"):
+                return
+            time.sleep(0.02)
+        self.status(f"{label}: arm did not settle within tolerance; continuing.", warn=True)
+
+    def call_trigger(self, client, name: str) -> str:
+        self.check_stop()
+        if self.p("dry_run"):
+            self.status(f"(dry run) would call {name}")
+            return ""
+        if not client.wait_for_service(timeout_sec=3.0):
+            raise RuntimeError(f"{name} not available. Launch bcr_endpoint_object_attacher first.")
+        res = self.wait_future(client.call_async(Trigger.Request()), 10.0)
+        if res is None or not res.success:
+            raise RuntimeError(f"{name} failed: {None if res is None else res.message}")
+        self.status(f"{name}: {res.message}")
+        return res.message
+
+    def place_joints(self, slot: int, from_xy, seeds: List[List[float]]) -> Tuple[List[float], List[float]]:
+        """IK for a ring 2 slot, solved once and cached (ring 2 is at the edge of the reach, so it is slow)."""
+        if slot not in self.place_solutions:
+            px, py = self.place_point(slot)
+            tip_z = self.p("place_surface_z") + self.p("place_tip_height") + self.p("place_drop_clearance")
+            # Seed with the station posture turned round joint1 (swing_direction side), so the
+            # arm reaches ring 2 with the same shape it has over ring 1 instead of flipping
+            # over the top with joint2.
+            mirrored = [self.turned_seed(s, from_xy, (px, py)) for s in seeds]
+            q_place = self.solve_ik((px, py, tip_z), mirrored, f"place slot {slot}")
+            q_app = self.solve_ik((px, py, tip_z + self.p("place_approach_height")), [q_place], f"place slot {slot} approach")
+            self.place_solutions[slot] = (q_app, q_place)
+        return self.place_solutions[slot]
+
+    def joint1_ccw(self, q: List[float]) -> float:
+        """+1 if increasing joint1 turns the tip counter-clockwise seen from above, else -1."""
+        names = list(self.p("joint_names"))
+        qd = dict(zip(names, q))
+        p0 = self.chain.tip_position(qd)
+        qd[names[0]] += 0.05
+        p1 = self.chain.tip_position(qd)
+        return 1.0 if p0[0] * p1[1] - p0[1] * p1[0] > 0 else -1.0
+
+    def turned_seed(self, seed: List[float], from_xy, to_xy) -> List[float]:
+        """seed with joint1 turned from from_xy's bearing to to_xy's, the swing_direction way."""
+        a = math.atan2(self.world_to_base(*from_xy, 0.0)[1], self.world_to_base(*from_xy, 0.0)[0])
+        b = math.atan2(self.world_to_base(*to_xy, 0.0)[1], self.world_to_base(*to_xy, 0.0)[0])
+        left = str(self.p("swing_direction")).lower() == "left"
+        theta = (b - a) % (2 * math.pi) if left else -((a - b) % (2 * math.pi))
+        out = list(seed)
+        j1 = seed[0] + self.joint1_ccw(seed) * theta
+        if j1 > 2 * math.pi:
+            j1 -= 2 * math.pi
+        elif j1 < -2 * math.pi:
+            j1 += 2 * math.pi
+        out[0] = j1
+        return out
+
+    def swing_joint1(self, q_from: List[float], q_to: List[float]) -> float:
+        """
+        joint1 goal for q_to, unwrapped by 2*pi so that going there from q_from turns the arm
+        the swing_direction way (the controller interpolates joint1 linearly, so this picks
+        the side of the swing).
+        """
+        names = list(self.p("joint_names"))
+        j1 = next((j for j in self.chain.movable if j.name == names[0]), None)
+        ccw = self.joint1_ccw(q_from)     # +joint1 turns the tip this way
+        want = (1.0 if str(self.p("swing_direction")).lower() == "left" else -1.0) * ccw
+        d = q_to[0] - q_from[0]
+        d = d % (2 * math.pi) if want > 0 else -((-d) % (2 * math.pi))
+        goal = q_from[0] + d
+        if j1 is not None and not (j1.lower <= goal <= j1.upper):
+            self.status(f"A {self.p('swing_direction')} swing needs joint1 = {goal:.2f}, outside its limits "
+                        f"[{j1.lower:.2f}, {j1.upper:.2f}]; swinging the other way.", warn=True)
+            return q_to[0]
+        return goal
+
+    def place_on_ring2(self, from_xy, seeds: List[List[float]], swing_duration: Optional[float] = None):
+        slot = self.place_count % max(1, int(self.p("place_slots")))
+        px, py = self.place_point(slot)
+        q_app, q_place = self.place_joints(slot, from_xy, seeds)
+        # same arm posture family on both sides, joint1 unwrapped for the chosen swing side
+        start = self.last_cmd if self.last_cmd is not None else self.current_vector()
+        shift = self.swing_joint1(start, q_app) - q_app[0]
+        q_app = [q_app[0] + shift] + list(q_app[1:])
+        q_place = [q_place[0] + shift] + list(q_place[1:])
+
+        use_zone = bool(self.p("use_release_camera")) and not self.p("dry_run")
+        if use_zone:
+            # wait beside the zone (same pose, joint1 turned back by place_wait_offset) so the
+            # release camera can see the zone, then go over it once it is free
+            reach = math.hypot(*self.world_to_base(px, py, 0.0)[:2])
+            back = self.p("place_wait_offset") / max(reach, 0.5)
+            q_wait = [q_app[0] - math.copysign(back, q_app[0] - start[0])] + list(q_app[1:])
+            self.move(q_wait, swing_duration or self.p("swing_duration"), f"swing {self.p('swing_direction')} to wait beside the release zone")
+            self.wait_release_zone_and_stop_ring2()
+            self.move(q_app, self.p("move_duration"), f"over the release zone (slot {slot})")
+        else:
+            self.move(q_app, swing_duration or self.p("swing_duration"), f"swing {self.p('swing_direction')} to place approach (slot {slot})")
+            if self.p("stop_ring2_for_release") and not self.p("dry_run"):
+                self.stop_bent2()
+        self.move(q_place, self.p("move_duration"), "place contact")
+        if not self.p("dry_run"):
+            time.sleep(self.p("release_settle_sec"))
+            cx, cy = self.p("ring2_center_x"), self.p("ring2_center_y")
+            a0 = math.atan2(self.p("place_y") - cy, self.p("place_x") - cx)
+            yaw = self.p("place_yaw") + math.atan2(py - cy, px - cx) - a0
+            self.set_attacher_params({
+                "exact_release": bool(self.p("place_exact")), "release_x": px, "release_y": py,
+                "release_on_surface": True, "release_surface_z": self.p("place_surface_z"),
+                "release_use_yaw": True, "release_yaw": math.atan2(math.sin(yaw), math.cos(yaw)),
+            })
+        self.call_trigger(self.release_client, "/release_object_from_endpoint")
+        self.move(q_app, self.p("move_duration"), "retreat")
+        self.place_count += 1
+
+        if self.p("verify_place") and not self.p("dry_run"):
+            if self.verify_near(px, py):
+                self.status(f"PLACED: object detected on ring 2 near ({px:.2f}, {py:.2f}).")
+            else:
+                self.status("Released, but the camera did not see the object on ring 2 near the place point.", warn=True)
+        if self.p("stop_ring2_for_release") and not self.p("dry_run"):
+            self.start_bent2()           # arm is clear: ring 2 carries the object away
+
+    def verify_near(self, px, py) -> bool:
+        end = time.time() + 2.0
+        while time.time() < end:
+            if any(math.hypot(x - px, y - py) <= self.p("verify_radius") for x, y in self.ring2_latest):
+                return True
+            time.sleep(0.1)
+        return False
+
+    # ----------------------------------------------------------- station mode
+    def run_station(self):
+        sx, sy, hz = self.p("station_x"), self.p("station_y"), self.p("hover_z")
+        self.tracker = RoiTracker((sx, sy), self.p("roi_radius"), self.p("catch_latency"),
+                                  max_speed=self.p("track_max_speed"), coast_time=self.p("track_coast_time"))
+        auto_select = self.p("enable_attacher_auto_select") and not self.p("dry_run")
+        if auto_select:
+            self.set_attacher_params({"auto_select_target": True})
+
+        seeds = [list(self.p("pick_seed")), self.current_vector(), list(self.p("transit_pose"))]
+        q_hover = self.solve_ik((sx, sy, hz), seeds, "station hover")
+        q_lift = self.solve_ik((sx, sy, hz + self.p("approach_height")), [q_hover], "station lift")
+        # solve every ring 2 slot before the first catch so the arm never stops to think while carrying
+        for slot in range(max(1, int(self.p("place_slots")))):
+            self.place_joints(slot, (sx, sy), [q_lift, q_hover])
+
+        failures = 0
+        at_station = False
+        use_side = bool(self.p("use_side_camera"))
+        while True:
+            if not at_station:
+                self.move(q_hover, self.p("swing_duration"), "station hover")
+                at_station = True
+            self.tracker.reset()
+            self.roi_state = {}
+            if use_side:
+                target = self.wait_for_cross_check()
+                try:
+                    msg, q_down, (gx, gy, gz) = self.grab_from_above(target, q_hover)
+                except RuntimeError as exc:
+                    failures += 1
+                    self.status(f"CATCH FAILED ({failures}/{self.p('max_failed_catches')}): {exc}. "
+                                f"Back to the station for the next object.", warn=True)
+                    # up out of the way first, then let the stopped product carry on
+                    self.move(q_hover, self.p("move_duration"), "back to station hover")
+                    self.abort_hold()
+                    if failures >= int(self.p("max_failed_catches")):
+                        raise RuntimeError(f"{failures} catches in a row failed; last error: {exc}")
+                    continue
+                failures = 0
+                self.status(f"CAUGHT: {msg}")
+                # a little straight up, then the swing
+                # lift first, before any other movement
+                lz = max(gz, min(gz + self.p("lift_height"), self.p("lift_max_z")))
+                if str(self.p("lift_joint")).lower() == "ik":
+                    q_up = self.solve_ik((gx, gy, lz), [q_down, q_lift], "lift")
+                else:
+                    q_up = self.single_joint_lift(q_down, lz)
+                self.move(q_up, self.p("move_duration"), f"lift ({self.p('lift_joint')}) to tip z {lz:.2f}")
+                at_station = False
+                self.place_on_ring2((gx, gy), [q_up, q_lift, q_hover], self.p("carry_swing_duration"))
+                if not self.p("loop") or self.stop_flag:
+                    break
+                continue
+            st = self.wait_for_roi_trigger()
+            try:
+                if auto_select:
+                    # grab the product where the camera says the object is, not just under the tip
+                    tx, ty = st.get("pred") or st["nearest"]
+                    self.set_attacher_params({"select_near_point": True, "select_x": tx, "select_y": ty})
+                msg = self.call_trigger(self.attach_client, "/attach_object_to_endpoint")
+            except RuntimeError as exc:
+                failures += 1
+                self.status(f"CATCH FAILED ({failures}/{self.p('max_failed_catches')}): {exc}. "
+                            f"Staying at the station for the next object.", warn=True)
+                if failures >= int(self.p("max_failed_catches")):
+                    raise RuntimeError(f"{failures} catches in a row failed; last error: {exc}")
+                continue
+            failures = 0
+            self.status(f"CAUGHT: {msg}")
+            self.move(q_lift, self.p("move_duration") * 0.6, "lift")
+            at_station = False
+            self.place_on_ring2((sx, sy), [q_lift, q_hover])
+            if not self.p("loop") or self.stop_flag:
+                break
+
+    def path_x(self, y: float) -> float:
+        """x of the product path (ring 1 circle) at this y, on the station's side of the ring."""
+        cx, cy, r = self.p("ring1_center_x"), self.p("ring1_center_y"), self.p("product_path_radius")
+        side = 1.0 if self.p("station_x") >= cx else -1.0
+        return cx + side * math.sqrt(max(0.0, r * r - (y - cy) ** 2))
+
+    def publish_cross_check(self, ok: bool, reason: str, top_xy=None, side=None):
+        self.cross_pub.publish(String(data=json.dumps({
+            "ok": ok, "reason": reason,
+            "top_y": None if top_xy is None else top_xy[1],
+            "side_y": None if side is None else side.get("y"),
+        })))
+
+    def wait_for_cross_check(self) -> Dict:
+        """
+        Wait until both cameras agree on one object at the station:
+          side camera: an object standing on the belt, |y - station_y| <= catch_window
+          top camera:  a track (seen or predicted under the arm) within cross_check_tol of it
+        Returns the object estimate {x, y, z_top, top_xy, side_y}.
+        """
+        sx, sy = self.p("station_x"), self.p("station_y")
+        self.status(f"Waiting at station ({sx:.2f}, {sy:.2f}); grabbing only when the top and side cameras agree "
+                    f"(window +/-{self.p('catch_window'):.2f} m, tolerance {self.p('cross_check_tol'):.2f} m)...")
+        last_log = time.time()
+        last_pub = 0.0
+        top_only_since = None
+        cooldown_until = 0.0
+        reason = "waiting"
+        while True:
+            self.check_stop()
+            time.sleep(0.03)
+            now = time.time()
+            st, side = self.roi_state, self.side_state
+            tracks = [(t[0], t[1]) for t in st.get("tracks_xy", [])]
+            side_ok = bool(side) and side.get("present") and now - side.get("_rx", 0.0) <= self.p("side_fresh_sec")
+            top_xy = None
+            if side_ok:
+                top_only_since = None
+                oy = float(side["y"])
+                ox = self.path_x(oy)
+                if tracks:
+                    top_xy = min(tracks, key=lambda t: math.hypot(t[0] - ox, t[1] - oy))
+                d = None if top_xy is None else math.hypot(top_xy[0] - ox, top_xy[1] - oy)
+                if abs(oy - sy) > self.p("catch_window"):
+                    reason = f"side sees an object at y={oy:+.2f}, not yet in the catch window"
+                elif d is None:
+                    reason = f"side sees an object at y={oy:+.2f} but the top camera has no track"
+                elif d > self.p("cross_check_tol"):
+                    reason = f"cameras disagree by {d:.2f} m (top ({top_xy[0]:.2f}, {top_xy[1]:.2f}), side y={oy:+.2f})"
+                elif now < cooldown_until:
+                    reason = "cooldown after a rejected object"
+                else:
+                    target = {"x": ox, "y": oy, "z_top": side.get("z_top"), "top_xy": top_xy, "side_y": oy,
+                              "height": side.get("height")}
+                    self.publish_cross_check(True, "ok", top_xy, side)
+                    self.status(f"CROSS-CHECK OK: side camera y={oy:+.3f} top z={side.get('z_top', 0.0):.3f}, "
+                                f"top camera ({top_xy[0]:.3f}, {top_xy[1]:.3f}), {d:.3f} m apart.")
+                    return target
+            elif st.get("trigger") or (st.get("dist") is not None and st["dist"] <= self.p("roi_radius")):
+                top_xy = st.get("nearest")
+                if top_only_since is None:
+                    top_only_since = now
+                reason = "top camera has an object at the station, side camera sees nothing on the belt"
+                if now - top_only_since > self.p("side_confirm_timeout"):
+                    self.status(f"CROSS-CHECK FAILED: {reason} for {self.p('side_confirm_timeout'):.1f}s; letting it pass.",
+                                warn=True)
+                    top_only_since = None
+                    cooldown_until = now + self.p("cross_check_cooldown")
+            else:
+                top_only_since = None
+                reason = "waiting"
+            if now - last_pub > 0.2:
+                last_pub = now
+                self.publish_cross_check(False, reason, top_xy, side if side_ok else None)
+            if now - last_log > 10.0:
+                last_log = now
+                if not self.side_state or now - self.side_state.get("_rx", 0.0) > 2.0:
+                    self.status("No results from side_camera_checker (is /side_camera/image bridged?).", warn=True)
+                if not self.ring1_history or now - self.ring1_history[-1][0] > 2.0:
+                    self.status("No detections from ring_object_detector yet (is the camera bridge running?).", warn=True)
+                self.status(f"Still waiting: {reason}.")
+
+    def grab_from_above(self, target: Dict, q_hover: List[float]) -> str:
+        """Stop the confirmed product, come down onto its top, attach."""
+        self.set_attacher_params({"auto_select_target": True, "select_near_point": True,
+                                  "select_x": target["x"], "select_y": target["y"]})
+        reply = self.call_trigger(self.hold_client, "/hold_object_for_pick")
+        self.holding = True
+        if self.p("dry_run"):
+            held = {"model": "(dry run)", "x": target["x"], "y": target["y"],
+                    "top_z": target.get("z_top") or self.p("pick_surface_z") + self.p("object_height")}
+        else:
+            held = json.loads(reply)
+
+        # where to come down: vision, unless it disagrees with the product that was actually stopped
+        x, y = target["x"], target["y"]
+        dxy = math.hypot(held["x"] - x, held["y"] - y)
+        if dxy > self.p("descend_xy_tol"):
+            self.status(f"Vision position is {dxy:.2f} m off the held {held['model']}; using the held position.", warn=True)
+            x, y = held["x"], held["y"]
+        top = target.get("z_top")
+        if top is None or abs(top - held["top_z"]) > self.p("descend_z_tol"):
+            self.status(f"Side camera top {top if top is None else round(top, 3)} vs held {held['model']} top "
+                        f"{held['top_z']:.3f}; using the held top.", warn=True)
+            top = held["top_z"]
+        tip_z = min(self.p("hover_z"), top + self.p("descend_gap"))
+        self.status(f"HOLDING {held['model']} at ({held['x']:.3f}, {held['y']:.3f}); descending to tip z {tip_z:.3f} "
+                    f"(object top {top:.3f}).")
+        q_down = self.solve_ik((x, y, tip_z), [q_hover, list(self.p("pick_seed"))], "descend onto object")
+        self.move(q_down, self.p("descend_duration"), "descend onto object")
+        msg = self.call_trigger(self.attach_client, "/attach_object_to_endpoint")
+        self.holding = False
+        return msg, q_down, (x, y, tip_z)
+
+    def stop_bent(self) -> str:
+        """Stop the first bent: every product on it stands still (attacher /stop_bent)."""
+        return self.call_trigger(self.stop_bent_client, "/stop_bent")
+
+    def start_bent(self) -> str:
+        """Run the first bent again; a product the arm holds stays with the arm (attacher /start_bent)."""
+        return self.call_trigger(self.start_bent_client, "/start_bent")
+
+    def stop_bent2(self) -> str:
+        """Stop the second bent: every object riding it stands still (attacher /stop_bent2)."""
+        return self.call_trigger(self.stop_bent2_client, "/stop_bent2")
+
+    def start_bent2(self) -> str:
+        """Run the second bent again (attacher /start_bent2)."""
+        return self.call_trigger(self.start_bent2_client, "/start_bent2")
+
+    def zone_empty_now(self, newer_than: float = 0.0) -> Optional[bool]:
+        """Latest release camera verdict (None: no fresh result yet)."""
+        z = self.zone_state
+        if not z or not z.get("ready") or time.time() - z.get("_rx", 0.0) > 1.0 or z.get("_rx", 0.0) < newer_than:
+            return None
+        return bool(z.get("empty"))
+
+    def wait_release_zone_and_stop_ring2(self):
+        """Wait until the release camera sees the zone empty, then stop ring 2 (and make sure it is still empty)."""
+        self.status("Waiting next to the release zone until it is empty...")
+        streak, last_log = 0, 0.0
+        while True:
+            self.check_stop()
+            time.sleep(0.1)
+            empty = self.zone_empty_now()
+            now = time.time()
+            if empty is None:
+                streak = 0
+                if now - last_log > 10.0:
+                    last_log = now
+                    self.status("No result from release_zone_monitor (is /release_camera/image bridged?).", warn=True)
+                continue
+            streak = streak + 1 if empty else 0
+            if not empty and now - last_log > 5.0:
+                last_log = now
+                self.status(f"Release zone OCCUPIED ({len(self.zone_state.get('blobs', []))} object(s)); arm waits holding the object.")
+            if streak < int(self.p("release_zone_clear_frames")):
+                continue
+            if not self.p("stop_ring2_for_release"):
+                self.status("Release zone EMPTY.")
+                return
+            self.stop_bent2()
+            t_stop = time.time()
+            # something may have slid in while stopping: check a frame taken after the stop
+            while True:
+                self.check_stop()
+                time.sleep(0.1)
+                after = self.zone_empty_now(newer_than=t_stop + 0.2)
+                if after is not None or time.time() - t_stop > 3.0:
+                    break
+            if after:
+                self.status("Release zone EMPTY and ring 2 stopped: releasing.")
+                return
+            self.status("Release zone got busy while ring 2 stopped; restarting ring 2 and waiting.", warn=True)
+            self.start_bent2()
+            streak = 0
+
+    def single_joint_lift(self, q: List[float], target_z: float) -> List[float]:
+        """q with only lift_joint turned, so the tip rises to target_z (or as high as that joint gets it)."""
+        names = list(self.p("joint_names"))
+        joint = str(self.p("lift_joint"))
+        if joint not in names:
+            raise RuntimeError(f"lift_joint '{joint}' is not one of {names}")
+        i = names.index(joint)
+        lim = next((j for j in self.chain.movable if j.name == joint), None)
+        bz = self.p("base_z")
+
+        def tip_z(delta):
+            qq = list(q)
+            qq[i] += delta
+            return bz + float(self.chain.tip_position(dict(zip(names, qq)))[2])
+
+        z0 = tip_z(0.0)
+        sign = 1.0 if tip_z(0.01) > z0 else -1.0       # which way of this joint lifts the tip
+        best, delta = 0.0, 0.0
+        while abs(delta) < self.p("lift_max_joint_delta"):
+            delta += sign * 0.01
+            if lim is not None and not (lim.lower <= q[i] + delta <= lim.upper):
+                break
+            z = tip_z(delta)
+            if z < tip_z(best):
+                break                                   # past the top of this joint's arc
+            best = delta
+            if z >= target_z:
+                break
+        out = list(q)
+        out[i] += best
+        self.get_logger().info(f"Lift with {joint}: {best:+.2f} rad, tip z {z0:.3f} -> {tip_z(best):.3f} (wanted {target_z:.3f})")
+        return out
+
+    def abort_hold(self):
+        """After a failed grab: let a stopped product carry on along the bent."""
+        if not self.holding:
+            return
+        self.holding = False
+        if self.p("dry_run"):
+            return
+        # called directly (not call_trigger) so it also runs after a stop request
+        res = None
+        if self.resume_client.wait_for_service(timeout_sec=2.0):
+            res = self.wait_future(self.resume_client.call_async(Trigger.Request()), 5.0)
+        if res is None or not res.success:
+            self.status(f"Could not resume the held product: {None if res is None else res.message}", warn=True)
+        else:
+            self.status(f"/resume_held_object: {res.message}")
+
+    def wait_for_roi_trigger(self) -> Dict:
+        self.status(f"Waiting at station ({self.p('station_x'):.2f}, {self.p('station_y'):.2f}) "
+                    f"for an object entering the ROI (r = {self.p('roi_radius'):.2f} m)...")
+        last_log = time.time()
+        while True:
+            self.check_stop()
+            self.ring1_event.wait(timeout=0.5)
+            self.ring1_event.clear()
+            st = self.roi_state
+            if st.get("trigger"):
+                vx, vy = st["velocity"]
+                self.status(f"ROI TRIGGER: object at ({st['nearest'][0]:.2f}, {st['nearest'][1]:.2f}), "
+                            f"{st['dist']:.2f} m from station, speed {math.hypot(vx, vy):.2f} m/s, "
+                            f"closest approach {st['pred_dist']:.2f} m in {st['time_to_closest']:.2f}s"
+                            f"{' (hidden under the arm, predicted)' if st.get('coasting') else ''}.")
+                return dict(st)
+            if time.time() - last_log > 10.0:
+                last_log = time.time()
+                if not self.ring1_history or time.time() - self.ring1_history[-1][0] > 2.0:
+                    self.status("No detections from ring_object_detector yet (is the camera bridge running?).", warn=True)
+                elif st.get("dist") is not None:
+                    self.status(f"Still waiting; nearest object {st['dist']:.2f} m from station.")
+
+    # --------------------------------------------------------- pick-zone mode
+    def find_stable_target(self) -> Tuple[float, float]:
+        zx, zy, zr = self.p("pick_zone_x"), self.p("pick_zone_y"), self.p("pick_zone_radius")
+        n, tol = int(self.p("stable_frames")), self.p("stable_tolerance")
+        end = time.time() + self.p("detection_timeout_sec")
+        self.status(f"Waiting for a still object on ring 1 within {zr:.2f} m of ({zx:.2f}, {zy:.2f})...")
+        while time.time() < end:
+            self.check_stop()
+            frames = list(self.ring1_history)[-n:]
+            if len(frames) == n and time.time() - frames[-1][0] < 1.0:
+                candidates = [(x, y) for x, y in frames[-1][1] if math.hypot(x - zx, y - zy) <= zr]
+                candidates.sort(key=lambda c: math.hypot(c[0] - zx, c[1] - zy))
+                for cx, cy in candidates:
+                    track = []
+                    for _, objs in frames:
+                        near = [o for o in objs if math.hypot(o[0] - cx, o[1] - cy) <= tol]
+                        if not near:
+                            break
+                        track.append(near[0])
+                    if len(track) == n:
+                        mx = sum(t[0] for t in track) / n
+                        my = sum(t[1] for t in track) / n
+                        self.status(f"Target on ring 1 at ({mx:.3f}, {my:.3f}), stable for {n} frames.")
+                        return mx, my
+            time.sleep(0.1)
+        raise RuntimeError("No stable object detected in the pick zone (is ring_object_detector running?).")
+
+    def run_pick_zone(self):
+        h, gap = self.p("object_height"), self.p("contact_gap")
+        pick_seed = list(self.p("pick_seed"))
+        while True:
+            tx, ty = self.find_stable_target()
+            pick_contact_z = self.p("pick_surface_z") + h + gap
+            current = self.current_vector()
+            q_app = self.solve_ik((tx, ty, pick_contact_z + self.p("approach_height")),
+                                  [pick_seed, current, list(self.p("transit_pose"))], "pick approach")
+            q_pick = self.solve_ik((tx, ty, pick_contact_z), [q_app, pick_seed], "pick contact")
+            self.move(q_app, self.p("swing_duration"), "pick approach")
+            self.move(q_pick, self.p("move_duration"), "pick contact")
+            self.call_trigger(self.attach_client, "/attach_object_to_endpoint")
+            self.move(q_app, self.p("move_duration"), "lift")
+            self.place_on_ring2((tx, ty), [q_app])
+            if not self.p("loop") or self.stop_flag:
+                break
+
+    # ------------------------------------------------------------------ worker
+    def worker(self):
+        try:
+            self.sync_from_attacher()
+            self.ensure_chain()
+            if self.p("mode") == "pick_zone":
+                self.run_pick_zone()
+            else:
+                self.run_station()
+            self.status("DONE.")
+        except StopRequested:
+            self.abort_hold()
+            self.status("Stopped on request.", warn=True)
+        except Exception as exc:
+            self.abort_hold()
+            self.status(f"Pick-and-place aborted: {exc}", warn=True)
+        finally:
+            self.busy = False
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisionPickPlace()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

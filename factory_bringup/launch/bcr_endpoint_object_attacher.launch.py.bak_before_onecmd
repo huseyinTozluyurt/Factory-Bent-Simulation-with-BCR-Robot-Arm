@@ -1,0 +1,92 @@
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package="factory_bringup",
+            executable="bcr_endpoint_object_attacher",
+            name="bcr_endpoint_object_attacher",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "world_name": "dual_circular_factory_world",
+                "target_model": "pickup_box",
+
+                "base_frame": "base_link",
+                "endpoint_frame": "gripper_tip",
+
+                "base_x": -0.200,
+                "base_y": -0.154,
+                "base_z": -0.508,
+                "base_yaw": 0.0,
+
+                # Object top face sits on the top of the gripper (endpoint_frame).
+                "attach_mode": "gripper_top",
+                "contact_gap": 0.005,
+
+                # Extra fine-tuning only; keep at 0 for an exact attach.
+                "attach_offset_frame": "world",
+                "attach_offset_x": 0.0,
+                "attach_offset_y": 0.0,
+                "attach_offset_z": 0.0,
+
+                "attach_rpy_roll": 0.0,
+                "attach_rpy_pitch": 0.0,
+                "attach_rpy_yaw": 0.0,
+                "keep_object_world_flat": True,
+
+                # V2.6 main enhancement:
+                # while carried: visible but no collision, so it cannot block the arm
+                "ghost_carry_on_attach": True,
+                "physical_release_on_release": True,
+
+                "carry_static": True,
+                "carry_gravity": False,
+                "carry_collision": False,
+
+                "release_static": False,
+                "release_gravity": True,
+                "release_collision": True,
+
+                "respawn_sleep_sec": 0.20,
+
+                "object_size_x": 0.34,
+                "object_size_y": 0.26,
+                "object_size_z": 0.26,
+                "object_mass": 0.20,
+                "object_ixx": 0.001,
+                "object_iyy": 0.001,
+                "object_izz": 0.001,
+
+                "pick_x": -2.175,
+                "pick_y": 1.195,
+                "pick_z": 2.006,
+                "pick_qx": 0.0,
+                "pick_qy": 0.0,
+                "pick_qz": 0.0,
+                "pick_qw": 1.0,
+
+                "exact_release": False,
+                "release_x": -2.175,
+                "release_y": 1.195,
+                "release_z": 1.90,
+                "release_qx": 0.0,
+                "release_qy": 0.0,
+                "release_qz": 0.0,
+                "release_qw": 1.0,
+
+                "update_hz": 25.0,
+                "gz_timeout_ms": 500,
+
+                "attach_settle_repeats": 3,
+                "attach_settle_sleep_sec": 0.03,
+                "release_settle_repeats": 3,
+                "release_settle_sleep_sec": 0.05,
+
+                "carry_retry_on_failure": True,
+                "carry_retry_sleep_sec": 0.015,
+            }],
+        )
+    ])
