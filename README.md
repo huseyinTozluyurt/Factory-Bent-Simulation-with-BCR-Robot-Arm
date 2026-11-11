@@ -2,7 +2,6 @@
 
 Vision-guided pick and place on factory conveyor belts ("bents"), in **ROS 2 Jazzy**, **Gazebo Harmonic** and **OpenCV**.
 
-🌐 **Project website:** https://huseyintozluyurt.github.io/Factory-Bent-Simulation-with-BCR-Robot-Arm/
 
 ![Dual circular factory with the BCR arm](docs/images/screenshot_2026-10-31_dual_circular_factory.png)
 
