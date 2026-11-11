@@ -316,13 +316,13 @@ td code { white-space: nowrap; }
 .footer p { margin: 0; }
 
 /* ---------- Motion ---------- */
-.reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.6s ease, transform 0.6s ease; }
-.reveal.shown { opacity: 1; transform: none; }
+.reveal-ready .reveal:not(.shown) { opacity: 0; transform: translateY(18px); }
+.reveal { transition: opacity 0.6s ease, transform 0.6s ease; }
 .fade-in { animation: fade 0.35s ease; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .reveal { opacity: 1; transform: none; transition: none; }
+  .reveal, .reveal-ready .reveal:not(.shown) { opacity: 1; transform: none; transition: none; }
   .fade-in, .lightbox { animation: none; }
 }
 

@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import { img } from '../data/content.js'
 
 /* ---------- Lightbox: click any figure to see it full size ---------- */
@@ -129,15 +129,12 @@ export function Compare({ before, after, beforeLabel, afterLabel }) {
 /* ---------- Fade-in on scroll ---------- */
 
 export function useReveal() {
-  const done = useRef(false)
+  // Content is visible by default. Only once the observer is running do we
+  // hide not-yet-seen blocks (html.reveal-ready), so a failed or doubled
+  // effect (React StrictMode runs effects twice in dev) never hides a section.
   useEffect(() => {
-    if (done.current) return
-    done.current = true
     const els = document.querySelectorAll('.reveal')
-    if (!('IntersectionObserver' in window)) {
-      els.forEach((el) => el.classList.add('shown'))
-      return
-    }
+    if (!('IntersectionObserver' in window)) return
     const io = new IntersectionObserver(
       (entries) =>
         entries.forEach((e) => {
@@ -146,10 +143,18 @@ export function useReveal() {
             io.unobserve(e.target)
           }
         }),
-      { rootMargin: '0px 0px -8% 0px' },
+      { rootMargin: '0px 0px -5% 0px' },
     )
-    els.forEach((el) => io.observe(el))
-    return () => io.disconnect()
+    els.forEach((el) => {
+      if (el.getBoundingClientRect().top < window.innerHeight) el.classList.add('shown')
+      else io.observe(el)
+    })
+    document.documentElement.classList.add('reveal-ready')
+    return () => {
+      io.disconnect()
+      document.documentElement.classList.remove('reveal-ready')
+      els.forEach((el) => el.classList.add('shown'))
+    }
   }, [])
 }
 
