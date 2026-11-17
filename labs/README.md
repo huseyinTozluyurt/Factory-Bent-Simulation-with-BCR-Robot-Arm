@@ -23,6 +23,7 @@ Each `lab_<name>.py` here is one experiment: its own detector (OpenCV or YOLO) a
 | 07_record_dataset | records an auto-labelled YOLO dataset while the arm keeps products moving |
 | 08_pipeline_sorting | pipeline world: all 12 arm stations sort by vision, each with its own rule and bins |
 | 09_pipeline_demo | pipeline demo in three acts: detection at A1, arm A1 to bent 2 / trash / recycling, then the whole factory; saves snapshots, a video of station A1 and report.txt |
+| 10_pipeline_tests | pipeline test cases: products through chains of arms into bins, onto further bents and into the docks; PASS / FAIL per product |
 
 ## Pipeline world
 
@@ -35,6 +36,7 @@ one it places on, and the station has its own trash and recycling bin.
 ./run_vision_lab.sh run 03_trash_and_recycle --station A6 # terminal 2: lab 03 at arm A6
 ./run_vision_lab.sh run 08_pipeline_sorting               # the whole factory
 ./run_vision_lab.sh run 09_pipeline_demo                  # the demo (add --fake --belt-speed 0.8 without Gazebo)
+./run_vision_lab.sh run 10_pipeline_tests                 # the test cases (PIPELINE_TESTS=name,... for some)
 ./run_vision_lab.sh run 02 --fake --station A2            # without Gazebo (drawn camera images)
 ./run_vision_lab.sh new my_line --template pipeline       # new whole-factory lab
 ```
@@ -60,3 +62,32 @@ def main(lab):
 
 Results (snapshots) go to `labs/results/<lab name>/<date_time>/`. Command-line `--world`, `--detector`,
 `--opt` and `--arm` override the values in the file. Full API: `factory_bringup/factory_bringup/vision_lab/README.md`.
+
+## Pipeline test cases (lab 10)
+
+`lab_10_pipeline_tests.py` holds 8 cases. Each puts known products on S1 and lets some arm stations
+work with a routing table (by the detector's label): products go into a station's trash or recycling
+bin, or onto the next bent, where the next arm picks them up again, until they reach a dock. The
+expected route of every product is worked out from the same table applied to its true type, and the
+product PASSES when it really took that route and ended there.
+
+| case | what it checks |
+|---|---|
+| one_hop_A1 | A1: S1 -> C1 |
+| bins_at_A1 | A1 sorts into its trash bin, its recycling bin and C1 |
+| two_hops_to_S3 | A1 then A3: S1 -> C1 -> S3 |
+| chain_to_large_dock | 4 arms: S1 -> C1 -> S3 -> C3 -> S7 -> dock 3 |
+| branch_on_C1 | A2 takes some products to S2 -> C2 -> dock 2, A3 the rest to S3 -> C3 -> dock 3 |
+| bins_along_the_chain | bins in the middle of the chain (A3 recycling, A5 trash), the rest to dock 3 |
+| longest_route_to_S9 | 6 arms: S1 -> C1 -> S3 -> C3 -> S6 -> C4 -> S9 -> dock 5 |
+| whole_factory_rules | stress test: all 12 stations with their pipeline_layout.py rules; products reach all 5 docks (needs every camera to keep up; with `--fake` on a small PC 1-2 products can go to the wrong dock) |
+
+```bash
+./run_vision_lab.sh run 10_pipeline_tests --fake --belt-speed 1.0          # all cases, no Gazebo
+PIPELINE_TESTS=branch_on_C1 ./run_vision_lab.sh run 10_pipeline_tests     # one case
+PIPELINE_DECIDE_BY=truth ./run_vision_lab.sh run 10_pipeline_tests        # arms and belts only, no vision
+```
+
+A failing product says why: the detector's label was wrong, a grasp missed, it fell, or it did not
+arrive in time. Add a case by copying a `PipelineCase(...)` in the file (framework:
+`factory_bringup/vision_lab/pipeline_testing.py`).

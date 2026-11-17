@@ -183,6 +183,7 @@ class FakeBackend:
         self.cams.append((arm, callback))
 
     active: Optional[set] = None                          # stations whose camera is drawn (None = all)
+    _empty: Dict = {}
 
     def tick(self, engine):
         self.engine = engine
@@ -212,6 +213,11 @@ class FakeBackend:
                 continue                                  # only the cameras the lab looks at
             prof = P.station_profile(arm)
             near = [it for it in items if math.hypot(it[1] - prof.camera_pose["x"], it[2] - prof.camera_pose["y"]) < 7.0]
+            if not near:                                  # nothing in view: the same empty picture
+                if arm not in self._empty:
+                    self._empty[arm] = render_view(prof, [], noise=self.noise)
+                cb(self._empty[arm].copy(), now)
+                continue
             cb(render_view(prof, near, noise=self.noise), now)
 
 

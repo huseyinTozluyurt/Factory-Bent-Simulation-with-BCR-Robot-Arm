@@ -52,6 +52,23 @@ class MissedGrasp(RuntimeError):
     pass
 
 
+class _SkipList:
+    """Products an arm leaves alone: for good (missed / unreachable), or for a while after decide()
+    said "skip" (it has passed the arm by then; on a ring it is judged again on its next lap, which
+    also corrects a skip that went to the wrong product when two stood close together)."""
+
+    def __init__(self, hold_sec: float = 8.0):
+        self.until: Dict[str, float] = {}
+        self.hold_sec = hold_sec
+        self.recorded: set = set()
+
+    def add(self, name: str, forever: bool = True):
+        self.until[name] = math.inf if forever else time.time() + self.hold_sec
+
+    def __contains__(self, name: str) -> bool:
+        return self.until.get(name, 0.0) > time.time()
+
+
 class _Station:
     def __init__(self, lab: "PipelineLab", arm: str, detector):
         self.arm = arm
@@ -450,56 +467,112 @@ class PipelineLab:
         arm = self._st(station).arm
         self.sim.move_arm(arm, self.sim.wait_posture(arm), duration, self._stop)
 
-    def _approaching(self, st: _Station, skip: set):
+    def _approaching(self, st: _Station, skip: "_SkipList"):
         """(detection, product, frame time) of a product the camera sees close to the pick point."""
         px, py = P.station(st.arm)["pick"]
         best, bd = None, self.timing["roi_radius"]
         t = st.latest[0]
         for d in self.detections(1, station=st.arm, fresh=1.5):
-            dist = math.hypot(d.x - px, d.y - py)
+            if math.hypot(d.x - px, d.y - py) > 2.0:
+                continue
+            x, y = self._predict(st, d, t)              # where it is now: frames can be far apart
+            dist = math.hypot(x - px, y - py)
             if dist <= bd:
-                x, y = self._predict(st, d, t)
                 prod = self.sim.nearest(P.station(st.arm)["pick_conv"], x, y, 0.4)
                 if prod is not None and prod.name not in skip:
                     best, bd = (d, prod, t), dist
         return best
 
-    def _velocity(self, st: _Station, d: ObjectDetection, t: float):
-        """The product's velocity from the camera: the same product in an earlier frame (0 if it stands)."""
+    def _along(self, conv: str, x0: float, y0: float, x1: float, y1: float) -> float:
+        """Distance along the conveyor's travel direction from (x0, y0) to (x1, y1)."""
+        ds = P.path_s(conv, x1, y1) - P.path_s(conv, x0, y0)
+        if P.is_ring(conv):
+            n = P.length(conv)
+            ds = ((ds + n / 2) % n - n / 2) * P.ring_dir(conv)
+        return ds
+
+    def _speed(self, st: _Station, d: ObjectDetection, t: float) -> Optional[float]:
+        """The product's speed along its belt from the camera: the same product in an earlier frame
+        (products never overtake, so it is the nearest detection a little upstream). None = unknown."""
+        conv = P.station(st.arm)["pick_conv"]
         with st.cond:
             hist = list(st.history)
         for t0, dets in reversed(hist):
-            if t - t0 < 0.35:
+            dt = t - t0
+            if dt < 0.15:
                 continue
-            if t - t0 > 1.5:
+            if dt > 3.0:
                 break
-            prev = min(dets, key=lambda e: math.hypot(e.x - d.x, e.y - d.y), default=None)
-            limit = self.belt_speed * (t - t0) * 1.5 + 0.08
-            if prev is not None and math.hypot(prev.x - d.x, prev.y - d.y) <= limit:
-                return (d.x - prev.x) / (t - t0), (d.y - prev.y) / (t - t0)
-            break
-        return 0.0, 0.0
+            best = None
+            for e in dets:
+                if e.bent != 1 or math.hypot(e.x - d.x, e.y - d.y) > self.belt_speed * dt * 1.4 + 0.15:
+                    continue
+                ds = self._along(conv, e.x, e.y, d.x, d.y)
+                if -0.06 <= ds <= self.belt_speed * dt * 1.3 + 0.1 and (best is None or ds < best):
+                    best = ds
+            return None if best is None else max(0.0, best) / dt
+        return None
 
     def _predict(self, st: _Station, d: ObjectDetection, t: float, until: Optional[float] = None):
-        """Where a product seen at (d.x, d.y) at time t is now, at the speed the camera measured."""
-        vx, vy = self._velocity(st, d, t)
-        dt = min(1.0, max(0.0, (until or time.time()) - t))
-        return d.x + vx * dt, d.y + vy * dt
+        """Where a product seen at (d.x, d.y) at time t is now: at the speed the camera measured, or at
+        the belt's speed when the camera has no earlier view of it."""
+        conv = P.station(st.arm)["pick_conv"]
+        v = self._speed(st, d, t)
+        if v is None:
+            v = self.belt_speed if self.sim.running_belts.get(conv, True) else 0.0
+        dt = min(2.0, max(0.0, (until or time.time()) - t))
+        if v * dt < 1e-3:
+            return d.x, d.y
+        s0 = P.path_s(conv, d.x, d.y)
+        sign = P.ring_dir(conv) if P.is_ring(conv) else 1
+        s1 = s0 + sign * v * dt
+        if not P.is_ring(conv):
+            s1 = min(s1, max(s0, P.length(conv) - 0.15))           # products stop at the end of a line
+        cx, cy, _ = P.path_xy(conv, s0)
+        x, y, _ = P.path_xy(conv, s1)
+        return x + d.x - cx, y + d.y - cy                         # keep the sideways offset
 
-    def _remeasure(self, st: _Station, xy, radius: float = 0.4, frames: int = 4) -> Optional[ObjectDetection]:
-        """The held (now standing) product's position from the next few frames, near where it should be
-        (a detector can miss a product in one frame, so any of `frames` frames counts)."""
-        best, bd = None, radius
-        for i in range(frames):
+    def _remeasure(self, st: _Station, xy, radius: float = 0.4, frames: int = 3,
+                   after: float = 0.0, timeout: float = 6.0, label: Optional[str] = None) -> Optional[ObjectDetection]:
+        """The held (now standing) product's position from frames taken after `after` (the hold), near
+        where it should be (a detector can miss a product in one frame, so any of `frames` frames counts)."""
+        best, bd, used = None, radius, 0
+        end = time.time() + timeout
+        while used < frames and time.time() < end:
             if not self.wait_for_frame(1.5, st.arm):
                 continue
-            for d in self.detections(1, station=st.arm):
+            t = st.latest[0]
+            if t < after + 0.05:                        # still a frame from before the hold
+                continue
+            used += 1
+            for d in self.detections(1, station=st.arm, fresh=10.0):
+                if label is not None and d.label != label:   # not the product we decided on
+                    continue
                 dist = math.hypot(d.x - xy[0], d.y - xy[1])
                 if dist <= bd:
                     best, bd = d, dist
-            if best is not None and i >= 1:
+            if best is not None and used >= 2:
                 break
         return best
+
+    def _too_early(self, arm: str, target: ObjectDetection, prod) -> bool:
+        """True when the product stands upstream of the pick point, out of the arm's reach: let it come on."""
+        st = P.station(arm)
+        conv = st["pick_conv"]
+        if not self.sim.running_belts.get(conv, True):
+            return False
+        try:
+            for dz in (0.25, 0.01):
+                self.sim.ik(arm, (target.x, target.y, BELT_TOP + prod.height + dz), [self.sim.arms[arm].q])
+            return False
+        except RuntimeError:
+            pass
+        sign = P.ring_dir(conv) if P.is_ring(conv) else 1
+        ds = (P.path_s(conv, target.x, target.y) - P.path_s(conv, *st["pick"])) * sign
+        if P.is_ring(conv):
+            n = P.length(conv)
+            ds = (ds + n / 2) % n - n / 2
+        return ds < 0
 
     def _grab(self, arm: str, target: ObjectDetection, prod) -> None:
         top = BELT_TOP + prod.height
@@ -512,7 +585,7 @@ class PipelineLab:
             raise MissedGrasp(f"vision put the product {off * 100:.0f} cm from where it is "
                               f"(tolerance {self.timing['grasp_tolerance'] * 100:.0f} cm)")
         self.sim.attach(arm, prod.name)
-        self._move_highest(arm, tx, ty, [min(top + 0.5, 2.35), top + 0.35, top + 0.2], self.timing["move_duration"])
+        self._move_highest(arm, tx, ty, [min(top + 0.5, 2.35), top + 0.35, top + 0.2, top + 0.12], self.timing["move_duration"])
 
     def _move_highest(self, arm: str, x: float, y: float, heights, duration: float):
         """Lift to the first of these heights the arm can reach at (x, y)."""
@@ -550,7 +623,7 @@ class PipelineLab:
         self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["swing_duration"], self._stop)
 
     def _cycle(self, arm: str, decide: Callable[[PickContext], str], deadline: Optional[float],
-               skip: set, halt: Optional[threading.Event] = None) -> Optional[PickResult]:
+               skip: "_SkipList", halt: Optional[threading.Event] = None) -> Optional[PickResult]:
         """Wait for the next product at this station, decide, pick, deliver. None on timeout / stop."""
         st = self._st(arm)
         self.activate(arm)
@@ -572,18 +645,25 @@ class PipelineLab:
                 self.log(f"{arm}: decide() failed for #{st.number} ({exc}); leaving it on the belt")
                 dest = "skip"
             if dest == "skip":
-                skip.add(prod.name)
-                self._record(ctx, "skip", "skipped")
+                skip.add(prod.name, forever=False)
+                if prod.name not in skip.recorded:             # one record per product, not per lap
+                    skip.recorded.add(prod.name)
+                    self._record(ctx, "skip", "skipped")
                 continue
             self.sim.hold(prod.name, True)
             held_at = time.time()
             try:
                 guess = self._predict(st, det, seen, held_at)
-                target = self._remeasure(st, guess)
+                target = self._remeasure(st, guess, after=held_at, label=det.label)
                 if target is None:                         # not seen again: grasp where vision predicted it
                     self.log(f"{arm}: #{st.number} not seen again after the hold; grasping at the predicted spot")
                     target = copy.copy(det)
                     target.x, target.y = guess
+                if self._too_early(arm, target, prod):           # held before it reached the arm
+                    self.sim.hold(prod.name, False)
+                    st.number -= 1
+                    self.wait_for_frame(1.0, arm)
+                    continue
                 with self._arm_locks[arm]:
                     self.log(f"{arm}: #{st.number} {det.label} -> {dest}")
                     self._grab(arm, target, prod)
@@ -613,7 +693,9 @@ class PipelineLab:
                     tx, ty, _ = self.sim.tip(arm)
                     self.sim.release_on_conveyor(arm, P.station(arm)["pick_conv"], tx, ty)
                 self.sim.hold(prod.name, False)
-                skip.add(prod.name)
+                misses[prod.name] = misses.get(prod.name, 0) + 1
+                if misses[prod.name] >= 3 or not P.is_ring(P.station(arm)["pick_conv"]):
+                    skip.add(prod.name)                            # a ring brings it round again
                 self.log(f"{arm}: #{st.number} not reachable: {exc}")
                 self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["swing_duration"])
         return None
@@ -639,7 +721,7 @@ class PipelineLab:
         self._stop.clear()
         self._feeding([self._st(station).arm])
         return self._cycle(self._st(station).arm, lambda ctx: dest,
-                           None if timeout is None else time.time() + timeout, set())
+                           None if timeout is None else time.time() + timeout, _SkipList())
 
     def move_to_bent2(self, timeout: Optional[float] = 120.0, station: Optional[str] = None):
         return self.transfer("bent2", timeout, station)
@@ -674,12 +756,14 @@ class PipelineLab:
 
     def run(self, policy: Union[Callable[[PickContext], str], Dict[str, str], str, None] = None,
             count: Optional[int] = None, timeout: Optional[float] = None, by: str = "label",
-            stations: Union[str, Iterable[str], None] = None) -> List[PickResult]:
+            stations: Union[str, Iterable[str], None] = None,
+            until: Optional[Callable[[], bool]] = None) -> List[PickResult]:
         """
         Keep catching products at the given stations (default: lab.station; "all" = A1 ... A12, each in
         its own thread) and let `policy` decide: a function (ctx) -> destination, a dict {label: dest,
         "*": default}, one destination, or None / "rules" = every station's rule from pipeline_layout.py.
-        count = stop after that many delivered products in total.
+        count = stop after that many delivered products in total; until() = stop when it returns True
+        (the arms finish their current delivery first).
         """
         names = P.STATIONS if stations == "all" else [s.upper() for s in ([stations] if isinstance(stations, str) else (stations or [self.station]))]
         if policy is None or policy in ("rules", "gui"):
@@ -703,7 +787,7 @@ class PipelineLab:
         done = threading.Event()
 
         def worker(arm):
-            skip = set()
+            skip = _SkipList()
             while not self._stop.is_set() and not done.is_set():
                 r = self._cycle(arm, decide, deadline, skip, halt=done)
                 if r is None and (deadline is not None and time.time() >= deadline):
@@ -711,6 +795,17 @@ class PipelineLab:
                 if count and sum(1 for x in self._results[start:] if x.status == "delivered") >= count:
                     done.set()                       # the other arms finish their current delivery
         threads = [self._spawn(worker, f"station_{a}", a) for a in names]
+        if until is not None:
+            def watch():
+                while not done.is_set() and any(t.is_alive() for t in threads):
+                    try:
+                        if until():
+                            done.set()
+                    except Exception as exc:
+                        self.log(f"run(until=...) failed: {exc}")
+                        done.set()
+                    time.sleep(0.5)
+            self._spawn(watch, "run_until")
         try:
             for t in threads:
                 while t.is_alive():

@@ -151,6 +151,14 @@ arms pick from (S1 for the whole factory); `--no-feed` turns that off, `--belt-s
 `--dry-run` and `set_motion` have no effect there. Not tested in Gazebo yet: the rendering of the
 station cameras and posing the arm links with `set_pose_vector` (tested with the `--fake` backend).
 
+### Pipeline test cases
+
+`pipeline_testing.py` runs test cases on a `PipelineLab`: `PipelineCase(name, items, routing)` puts
+products on S1, lets the stations in `routing` work, works out every product's expected route and
+final place (bin, dock or conveyor) from the same routing applied to its true type, and reports
+PASS / FAIL per product. `run(..., until=fn)` stops a run when `fn()` is true (arms finish their
+current delivery). The cases are in `labs/lab_10_pipeline_tests.py`.
+
 ## How it fits the existing nodes
 
 `run_vision_lab.sh sim` is `run_factory.sh ... run_detector:=false run_controller:=false`. The lab then
