@@ -70,10 +70,41 @@ class Arm:
 
 
 # ------------------------------------------------------------------------------------------ backends
+GZ_BINDINGS_HELP = (
+    "The pipeline lab needs the gz-transport Python bindings (gz.transport13, gz.msgs10).\n"
+    "On ROS 2 Jazzy (Gazebo Harmonic) install them from the Gazebo package repository:\n"
+    "  sudo curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg\n"
+    "  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] "
+    "http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main\" "
+    "| sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null\n"
+    "  sudo apt update && sudo apt install python3-gz-transport13 python3-gz-msgs10\n"
+    "Check:  python3 -c 'import gz.transport13, gz.msgs10'\n"
+    "Or run the lab without Gazebo: add --fake")
+
+
+def _add_vendor_gz_python_paths():
+    """ROS 2 installs Gazebo as vendor packages under /opt/ros/<distro>/opt/gz_*_vendor; where they ship
+    Python bindings, put them on sys.path (and GZ_PYTHON_PATH=dir1:dir2 for a custom location)."""
+    import glob
+    import os
+    import sys
+    dirs = [d for d in os.environ.get("GZ_PYTHON_PATH", "").split(os.pathsep) if d]
+    for pat in ("/opt/ros/*/opt/gz_*_vendor/lib/python*/site-packages", "/opt/ros/*/opt/gz_*_vendor/lib/python*/dist-packages",
+                "/opt/ros/*/opt/gz_*_vendor/lib/python"):
+        dirs += sorted(glob.glob(pat))
+    for d in dirs:
+        if os.path.isdir(os.path.join(d, "gz")) and d not in sys.path:
+            sys.path.append(d)
+
+
 class GzBackend:
     """Gazebo through gz-transport (the Python bindings the attacher already uses)."""
 
     def __init__(self, world: str = P.WORLD_NAME):
+        try:
+            import gz.transport13  # noqa: F401
+        except ImportError:
+            _add_vendor_gz_python_paths()
         try:
             from gz.transport13 import Node
             from gz.msgs10.boolean_pb2 import Boolean
@@ -83,8 +114,7 @@ class GzBackend:
             from gz.msgs10.pose_pb2 import Pose
             from gz.msgs10.pose_v_pb2 import Pose_V
         except ImportError as exc:
-            raise ImportError("The pipeline lab needs the gz-transport Python bindings: "
-                              "sudo apt install python3-gz-transport13 python3-gz-msgs10") from exc
+            raise ImportError(GZ_BINDINGS_HELP) from exc
         self.m = dict(Boolean=Boolean, EntityFactory=EntityFactory, Entity=Entity, Image=Image, Pose=Pose, Pose_V=Pose_V)
         self.node = Node()
         self.world = world

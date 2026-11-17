@@ -86,8 +86,9 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
     echo "Building $world_file ..."
     (cd "$PROJECT_DIR/my_factory_worlds/tools" && python3 make_pipeline_lab_world.py)
   fi
-  if ! python3 -c "import gz.transport13, gz.msgs10" 2>/dev/null; then
-    echo "Note: the lab needs the gz-transport Python bindings: sudo apt install python3-gz-transport13"
+  if ! python3 -c "from factory_bringup.vision_lab.pipeline_sim import _add_vendor_gz_python_paths as f; f(); import gz.transport13, gz.msgs10" 2>/dev/null; then
+    echo "Note: the lab needs the gz-transport Python bindings (sudo apt install python3-gz-transport13 python3-gz-msgs10"
+    echo "      from packages.osrfoundation.org, see COMMANDS.md). Without them use: $0 run LAB --fake"
   fi
   export GZ_SIM_RESOURCE_PATH="$share${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
   if pgrep -f "gz sim" > /dev/null; then

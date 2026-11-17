@@ -730,7 +730,11 @@ with its own detector and arm calls (`lab.move_to_bent(2)`, `lab.move_to_trash()
 ## Vision labs in the pipeline world
 
 ```bash
-sudo apt install python3-gz-transport13                    # once: the lab drives Gazebo over gz-transport
+# once: the lab drives Gazebo over gz-transport. On Jazzy the Python bindings come from the Gazebo repository:
+sudo curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null
+sudo apt update && sudo apt install python3-gz-transport13 python3-gz-msgs10
+python3 -c 'import gz.transport13, gz.msgs10' && echo bindings ok
 ./run_vision_lab.sh sim --world pipeline                    # Gazebo with pipeline_factory_lab.sdf (cameras, bins, movable arms)
 ./run_vision_lab.sh run 02_bent_to_bent --station A2        # any lab at one arm station (A1 ... A12)
 ./run_vision_lab.sh run 08_pipeline_sorting                 # every station sorts by vision
