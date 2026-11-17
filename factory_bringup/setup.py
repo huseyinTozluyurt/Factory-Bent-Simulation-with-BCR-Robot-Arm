@@ -8,7 +8,7 @@ setup(
     name=package_name,
     version='0.0.1',
     packages=[package_name, package_name + '.vision_lab', package_name + '.vision_lab.detectors',
-              package_name + '.vision_lab.templates'],
+              package_name + '.vision_lab.templates', package_name + '.lab_ide'],
     data_files=[
         ('share/ament_index/resource_index/packages',
          ['resource/' + package_name]),
@@ -33,6 +33,7 @@ setup(
             'capture_product_images = factory_bringup.capture_product_images:main',
             'vision_lab = factory_bringup.vision_lab.main:main',
             'factory_products = factory_bringup.custom_products:main',
+            'lab_ide = factory_bringup.lab_ide.app:main',
 
         ],
     },

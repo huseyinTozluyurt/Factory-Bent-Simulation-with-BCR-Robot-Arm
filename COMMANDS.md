@@ -2,6 +2,29 @@
 
 ROS 2 Jazzy + Gazebo Harmonic. Workspace: `~/ros2_ws`, project: `~/ros2_ws/src/factory_bent_project`.
 
+## Lab IDE (desktop app: pick a world, edit the lab script, build and run)
+
+```bash
+cd ~/ros2_ws/src/factory_bent_project
+./run_lab_ide.sh                                   # the IDE (opens the last project); needs python3-pyqt5
+./run_lab_ide.sh ~/vision_lab_projects/my_lab      # open a lab project
+# after colcon build also:  ros2 run factory_bringup lab_ide
+```
+
+- **File > New project** (Ctrl+N): name, folder (default `~/vision_lab_projects`), world (pipeline,
+  pipeline-tree, dual, circular, straight, straight-circular, circular-straight, straight-straight) and a
+  starter. "Generated for this world" writes `lab_<name>.py` with every station, arm, bent, bin and dock of
+  that world and a `PLAN` per arm; the vision_lab templates and the labs/lab_*.py files are starters too.
+  The project folder holds `labide.json` (world, run options) and the scripts.
+- **Build** (Ctrl+B): saves, checks the scripts for Python errors (double-click an error line to jump to it)
+  and runs `colcon build --packages-select factory_bringup` only when the installed copy differs from the
+  source. Build > Rebuild factory_bringup always builds.
+- **Run** (F5): Build, then `./run_vision_lab.sh sim --world W --drawn-cameras` (Simulation pane), waits until
+  the world is up, then `./run_vision_lab.sh run lab_<name>.py --world W` (Lab pane). **Start simulation** (F6)
+  and **Run lab only** (F7) do one of them; each pane has a Stop button, **Stop all** is Shift+F5.
+  Run options: drawn cameras, headless, NVIDIA, `--fake` (pipeline worlds without Gazebo), extra args and
+  environment (e.g. `PIPELINE_CAMERA=lite`). Results go to `<project>/results/<name>/<time>/`.
+
 ## 0. Everything with one command (optional)
 
 `run_factory.sh` in the project folder replaces terminals T1, T2, T3 and T4:
