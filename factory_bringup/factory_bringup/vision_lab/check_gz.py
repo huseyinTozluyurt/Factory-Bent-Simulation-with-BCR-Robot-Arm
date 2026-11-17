@@ -69,7 +69,17 @@ def main() -> int:
         end = time.time() + 10
         while not got and time.time() < end:
             time.sleep(0.2)
-        line(bool(got), f"camera {P.camera_topic('A1')}: " + (f"image {got[0]}" if got else "no image in 10 s"))
+        line(bool(got), f"camera {P.camera_topic('A1')} through the gz Python bindings: "
+             + (f"image {got[0]}" if got else "no image in 10 s"))
+        if not got:
+            ok_all = True                             # the lab has a fallback for this: test it
+            gz._start_ros_bridge(log=lambda t: None)
+            end = time.time() + 15
+            while not got and time.time() < end:
+                time.sleep(0.2)
+            line(bool(got), "camera through ros_gz_bridge (the lab's automatic fallback): "
+                 + (f"image {got[0]}" if got else "no image in 15 s"))
+            gz.close()
     except Exception as exc:
         line(False, f"camera {P.camera_topic('A1')}: {exc}")
 

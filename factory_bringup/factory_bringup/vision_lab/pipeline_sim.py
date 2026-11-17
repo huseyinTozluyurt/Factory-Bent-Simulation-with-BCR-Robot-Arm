@@ -128,6 +128,10 @@ class GzBackend:
         self._vector_fails = 0
         self._sender = threading.Thread(target=self._send_loop, name="gz_pose_sender", daemon=True)
         self._sender.start()
+        self._cams: List[Tuple] = []                # (topic, callback, wanted) of every camera subscription
+        self._last_image = 0.0
+        self._bridge = None                         # ros_gz_bridge process, when the bindings get no images
+        self._ros = None                            # (rclpy node, executor thread) of that fallback
 
     def running(self) -> bool:
         try:
@@ -248,7 +252,10 @@ class GzBackend:
         """wanted() False = drop the image before converting it (a station with nothing to do)."""
         Image = self.m["Image"]
 
+        self._cams.append((topic, callback, wanted))
+
         def on_image(msg):
+            self._last_image = time.time()
             if wanted is not None and not wanted():
                 return
             h, w = msg.height, msg.width
@@ -259,6 +266,84 @@ class GzBackend:
             callback(rgb[:, :, ::-1].copy(), time.time())
         if not self.node.subscribe(Image, topic, on_image):
             raise RuntimeError(f"cannot subscribe to {topic}")
+
+    def ensure_cameras(self, timeout: float = 8.0, log=print) -> str:
+        """Wait for a camera image through the Python bindings; if none comes (seen with the OSRF
+        bindings next to ROS's own Gazebo: requests work, subscriptions stay silent), receive the
+        images through ros_gz_bridge + rclpy instead. PIPELINE_CAMERA_BRIDGE=1 forces it, =0 forbids it."""
+        import os
+        mode = os.environ.get("PIPELINE_CAMERA_BRIDGE", "auto").strip().lower()
+        if not self._cams or mode in ("0", "off", "no"):
+            return "gz-transport"
+        if mode not in ("1", "on", "yes"):
+            end = time.time() + timeout
+            while time.time() < end and self._last_image == 0.0:
+                time.sleep(0.2)
+            if self._last_image:
+                return "gz-transport"
+            log(f"no camera image through the gz Python bindings in {timeout:.0f} s: "
+                "receiving the cameras through ros_gz_bridge instead")
+        self._start_ros_bridge(log)
+        return "ros_gz_bridge"
+
+    def _start_ros_bridge(self, log=print):
+        import subprocess
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.qos import qos_profile_sensor_data
+            from sensor_msgs.msg import Image as RosImage
+        except ImportError as exc:
+            raise RuntimeError(f"the ros_gz_bridge camera fallback needs ROS 2 (rclpy, sensor_msgs): {exc}")
+        args = [f"{t}@sensor_msgs/msg/Image[gz.msgs.Image" for t, _cb, _w in self._cams]
+        self._bridge = subprocess.Popen(["ros2", "run", "ros_gz_bridge", "parameter_bridge"] + args,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not rclpy.ok():
+            rclpy.init()
+        node = rclpy.create_node("pipeline_lab_cameras")
+
+        def make_cb(callback, wanted):
+            def cb(msg):
+                self._last_image = time.time()
+                if wanted is not None and not wanted():
+                    return
+                h, w, step = msg.height, msg.width, msg.step or msg.width * 3
+                data = np.frombuffer(bytes(msg.data), np.uint8)
+                if data.size < h * step:
+                    return
+                img = data[: h * step].reshape(h, step)[:, : w * 3].reshape(h, w, 3)
+                if msg.encoding.lower().startswith("rgb"):
+                    img = img[:, :, ::-1]
+                callback(img.copy(), time.time())
+            return cb
+        for topic, callback, wanted in self._cams:
+            node.create_subscription(RosImage, topic, make_cb(callback, wanted), qos_profile_sensor_data)
+        ex = SingleThreadedExecutor()
+        ex.add_node(node)
+        th = threading.Thread(target=ex.spin, name="pipeline_lab_ros_cameras", daemon=True)
+        th.start()
+        self._ros = (node, ex, th)
+        end = time.time() + 15.0
+        first = self._last_image
+        while time.time() < end and self._last_image == first:
+            time.sleep(0.2)
+        log("camera images arrive through ros_gz_bridge" if self._last_image != first else
+            "still no camera image through ros_gz_bridge either: check  gz topic -e -t /pipeline/A1/camera -n 1")
+
+    def close(self):
+        if self._ros is not None:
+            node, ex, _th = self._ros
+            try:
+                ex.shutdown()
+                node.destroy_node()
+            except Exception:
+                pass
+        if self._bridge is not None and self._bridge.poll() is None:
+            self._bridge.terminate()
+            try:
+                self._bridge.wait(3.0)
+            except Exception:
+                self._bridge.kill()
 
     def tick(self, engine):
         pass

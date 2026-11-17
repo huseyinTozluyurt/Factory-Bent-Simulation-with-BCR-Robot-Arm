@@ -164,6 +164,11 @@ class PipelineLab:
             else:
                 backend.subscribe_camera(P.camera_topic(a), self._camera_cb(a))
         self.sim.start()
+        if hasattr(backend, "ensure_cameras"):            # Gazebo: images through the bindings or the ROS bridge
+            try:
+                backend.ensure_cameras(log=self.log)
+            except RuntimeError as exc:
+                self.log(str(exc))
         self.activate(self.station)
         self._spawn(self._feed_loop, "pipeline_lab_feeder")
         self._spawn(self._health_loop, "pipeline_lab_health")
