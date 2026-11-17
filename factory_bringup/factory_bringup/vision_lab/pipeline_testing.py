@@ -27,6 +27,7 @@ conveyor name ("C1" = still riding ring C1 because no working arm takes it, "S2"
 end of S2).
 """
 
+import os
 import math
 import threading
 import time
@@ -429,10 +430,17 @@ class AllBoxesPolicy:
 
 class S1Feeder:
     """Puts `items` on S1 one after another, the next one as soon as the start of the belt is free
-    (min_gap m). A spawn Gazebo refuses is logged and tried again; it never stops the test."""
+    (min_gap m) and fewer than max_on_belt products are on it (PIPELINE_FEED_MAX overrides the default). A spawn Gazebo refuses is logged and tried again; it never stops the test."""
 
-    def __init__(self, lab, items: List[str], conv: str = "S1", min_gap: float = 1.2):
+    def __init__(self, lab, items: List[str], conv: str = "S1", min_gap: float = 1.2,
+                 max_on_belt: Optional[int] = None):
         self.lab, self.items, self.conv, self.min_gap = lab, list(items), conv, min_gap
+        # throttle: at most this many products on the belt at once (default: 2 per arm picking from it,
+        # plus one), so the belt never fills up faster than its arms can empty it. 0 = no limit.
+        if max_on_belt is None:
+            env = os.environ.get("PIPELINE_FEED_MAX", "").strip()
+            max_on_belt = int(env) if env else 2 * len(pickers(conv)) + 1
+        self.max_on_belt = max_on_belt
         self.names: List[str] = []
         self.failures = 0
         self._stop = threading.Event()
@@ -452,8 +460,10 @@ class S1Feeder:
     def _loop(self):
         sim, s0 = self.lab.sim, 0.4
         while not self._stop.is_set() and not self.done:
-            free = all(abs(p.s - s0) > self.min_gap for p in sim.on_conveyor(self.conv))
-            if not free or not sim.belt_moving(self.conv):          # no spawning while an arm grasps there
+            on_belt = sim.on_conveyor(self.conv)
+            free = all(abs(p.s - s0) > self.min_gap for p in on_belt)
+            full = self.max_on_belt and len(on_belt) >= self.max_on_belt   # wait until the arms take some
+            if not free or full or not sim.belt_moving(self.conv):  # no spawning while an arm grasps there
                 self._stop.wait(0.3)
                 continue
             ptype = self.items[len(self.names)]
