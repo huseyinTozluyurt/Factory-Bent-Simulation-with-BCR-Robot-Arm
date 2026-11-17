@@ -24,6 +24,7 @@ Each `lab_<name>.py` here is one experiment: its own detector (OpenCV or YOLO) a
 | 08_pipeline_sorting | pipeline world: all 12 arm stations sort by vision, each with its own rule and bins |
 | 09_pipeline_demo | pipeline demo in three acts: detection at A1, arm A1 to bent 2 / trash / recycling, then the whole factory; saves snapshots, a video of station A1 and report.txt |
 | 10_pipeline_tests | pipeline test cases: products through chains of arms into bins, onto further bents and into the docks; PASS / FAIL per product |
+| 12_arm_order | every arm picks each product that comes near it and puts it where its own order says, in turn (e.g. trash -> recycling -> next bent); orders per arm, mix them |
 | 11_all_boxes | whole pipeline test: 70 products enter on S1, all 13 bents and all 12 arms run; PASS when every one of the 29 boxes (24 station bins + 5 docks) has a product and all remaining products reached the docks |
 
 ## Pipeline world
@@ -129,3 +130,26 @@ pick belt still for the whole pick and delivery, `--arm pause_belt=off` never st
 
 The pipeline world is heavy for a PC; see "Making the pipeline simulation lighter" in COMMANDS.md
 (`--headless`, `PIPELINE_CAMERA=lite`, lazy cameras, a larger physics step).
+
+## Each arm in its own order (lab 12)
+
+`lab_12_arm_order.py`: 40 products enter on S1. Each arm picks every product that comes near it and
+sends it where its ORDER says, in turn. With `["trash", "recycling", "bent2"]` the first product goes
+into its trash bin, the second into its recycling bin, the third onto the next bent, then it starts
+again. Edit `ORDERS` in the file to give each arm its own order. The order only advances on a
+successful pick.
+
+```bash
+./run_vision_lab.sh run 12_arm_order                       # with ./run_vision_lab.sh sim --world pipeline running
+./run_vision_lab.sh run 12_arm_order --fake                # no Gazebo
+```
+
+## How arms find products (all pipeline labs)
+
+`--arm locate=assist` (default) means the camera finds the product first. When the camera hasn't
+reported a product that has reached the arm for a second, or puts it more than 10 cm off, the arm
+picks it at the simulation's position instead. The log and the report count these "assists", so you
+can see how well the vision works. `--arm locate=vision` uses the camera only, and
+`--arm locate=truth` uses no vision at all. Every run writes `lab.log` into its results folder. Its
+`health:` lines (every 30 s) show, per arm, the camera frames, the detector hits and the products at
+the arm.

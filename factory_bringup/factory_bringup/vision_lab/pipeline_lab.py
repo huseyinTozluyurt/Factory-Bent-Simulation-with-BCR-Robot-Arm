@@ -100,7 +100,15 @@ class PipelineLab:
         self.recorder = YoloDatasetRecorder(record_dataset, **(record_options or {})) if record_dataset else None
         self.timing = {"move_duration": 0.9, "swing_duration": 2.5, "grasp_tolerance": 0.10, "roi_radius": 0.45,
                        "place_wait_sec": 30.0,
-                       "pause_belt": "grasp"}   # grasp: a belt stands still while an arm grasps from or places
+                       "pause_belt": "grasp",
+                       "locate": os.environ.get("PIPELINE_LOCATE", "assist")}
+        # locate: how an arm finds the product it grasps
+        #   vision  only the camera (a product the detector misses is not picked; a position more than
+        #           grasp_tolerance off is a missed grasp)
+        #   assist  the camera first; when it has not seen a product that has reached the arm for a
+        #           second, or its position is too far off, the arm uses the simulation's position
+        #           (counted and logged as "assist", so you see how good the vision is)
+        #   truth   the simulation's position and type only (tests the arms and belts without vision)   # grasp: a belt stands still while an arm grasps from or places
                                                 # on it; cycle: the pick belt stands for the whole pick+deliver; off
         self.timing.update({k: v for k, v in (arm_params or {}).items() if k in self.timing})
         self.belt_speed = belt_speed
@@ -128,6 +136,10 @@ class PipelineLab:
             lazy_cameras = os.environ.get("PIPELINE_LAZY_CAMERAS", "1").strip().lower() not in ("0", "false", "no", "off")
         self.lazy_cameras = lazy_cameras
         self._size_warned: set = set()
+        self.assists: Dict[str, int] = {}                 # station -> picks the simulation's position helped
+        self._near_since: Dict[str, float] = {}            # product -> since when it waits at an arm unseen
+        self._frames: Dict[str, int] = {}                  # station -> camera frames received (health log)
+        self._ndets: Dict[str, int] = {}                   # station -> detector runs that found something
         if start:
             self.start()
 
@@ -154,6 +166,7 @@ class PipelineLab:
         self.sim.start()
         self.activate(self.station)
         self._spawn(self._feed_loop, "pipeline_lab_feeder")
+        self._spawn(self._health_loop, "pipeline_lab_health")
         if self._show_window:
             self._spawn(self._window_loop, "pipeline_lab_window")
         self._started = True
@@ -191,6 +204,12 @@ class PipelineLab:
 
     def log(self, text: str):
         print(f"[vision_lab] {text}", flush=True)
+        try:                                               # also into <results>/lab.log, for later reading
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(os.path.join(self.output_dir, "lab.log"), "a") as f:
+                f.write(time.strftime("%H:%M:%S ") + text + "\n")
+        except Exception:
+            pass
         for cb in list(self._status_callbacks):
             try:
                 cb(text)
@@ -229,6 +248,7 @@ class PipelineLab:
 
         def cb(bgr, t):
             st = self.stations[arm]
+            self._frames[arm] = self._frames.get(arm, 0) + 1
             h, w = bgr.shape[:2]
             if (w, h) != (want_w, want_h):                 # world built with another PIPELINE_CAMERA setting:
                 if arm not in self._size_warned:           # scale to the size the geometry expects
@@ -278,6 +298,8 @@ class PipelineLab:
                 time.sleep(1.0)
                 continue
             now = t                                            # capture time of the frame
+            if dets:
+                self._ndets[st.arm] = self._ndets.get(st.arm, 0) + 1
             with st.cond:
                 st.latest = (now, dets, bgr)
                 st.history.append((now, dets))
@@ -293,6 +315,23 @@ class PipelineLab:
                     self.log(f"on_frame callback failed: {exc}")
             if self._show_window:
                 st.view = (bgr, dets, mask)
+
+    def _health_loop(self, period: float = 30.0):
+        """Every `period` s, one line per working station: camera frames, detector hits, products at the arm."""
+        last: Dict[str, int] = {}
+        while not self._closed.wait(period):
+            parts = []
+            for a, st in self.stations.items():
+                if not st.active:
+                    continue
+                n = self._frames.get(a, 0)
+                near = sum(1 for p in self.sim.on_conveyor(P.station(a)["pick_conv"])
+                           if math.hypot(p.x - P.station(a)["pick"][0], p.y - P.station(a)["pick"][1]) < 1.0)
+                parts.append(f"{a} frames+{n - last.get(a, 0)} hits {self._ndets.get(a, 0)} at-arm {near}"
+                             + (f" assists {self.assists[a]}" if self.assists.get(a) else ""))
+                last[a] = n
+            if parts:
+                self.log("health: " + "; ".join(parts))
 
     def _frame_wanted(self, arm: str, idle_period: float = 2.0):
         """For the Gazebo camera callback: take every frame of a busy station, one every idle_period s
@@ -541,7 +580,36 @@ class PipelineLab:
                 prod = self.sim.nearest(P.station(st.arm)["pick_conv"], x, y, 0.4)
                 if prod is not None and prod.name not in skip:
                     best, bd = (d, prod, t), dist
-        return best
+        locate = self.timing.get("locate", "assist")
+        if locate == "vision" or (best is not None and locate != "truth"):
+            if best is not None:
+                self._near_since.pop(best[1].name, None)
+            return best
+        return self._unseen_at_arm(st, skip, wait=0.0 if locate == "truth" else 1.0)
+
+    def _unseen_at_arm(self, st: _Station, skip: "_SkipList", wait: float):
+        """locate=assist / truth: a product that has reached the arm's pick point (simulation truth) and
+        that the camera has not reported for `wait` s, as a detection at its true position."""
+        conv = P.station(st.arm)["pick_conv"]
+        px, py = P.station(st.arm)["pick"]
+        now = time.time()
+        best, bd = None, self.timing["roi_radius"]
+        for p in self.sim.on_conveyor(conv):
+            if p.name in skip:
+                continue
+            dist = math.hypot(p.x - px, p.y - py)
+            if dist > bd:
+                continue
+            first = self._near_since.setdefault(p.name, now)
+            if now - first >= wait:
+                best, bd = p, dist
+        if best is None:
+            return None
+        sx, sy, _ = best.size
+        label = best.ptype if self.timing.get("locate") == "truth" else "unknown"
+        det = ObjectDetection(u=0.0, v=0.0, label=label, score=0.0, x=best.x, y=best.y, size_x=sx, size_y=sy, bent=1)
+        det.assisted = True
+        return det, best, now
 
     def _along(self, conv: str, x0: float, y0: float, x1: float, y1: float) -> float:
         """Distance along the conveyor's travel direction from (x0, y0) to (x1, y1)."""
@@ -640,6 +708,14 @@ class PipelineLab:
         self._move_highest(arm, tx, ty, [top + 0.25, top + 0.15], self.timing["move_duration"] * 1.3)
         self._move(arm, (tx, ty, top + 0.01), self.timing["move_duration"])
         off = math.hypot(prod.x - tx, prod.y - ty)
+        if off > self.timing["grasp_tolerance"] and self.timing.get("locate", "assist") != "vision":
+            self.assists[arm] = self.assists.get(arm, 0) + 1
+            self.log(f"{arm}: assist #{self.assists[arm]}: vision put {prod.ptype} {off * 100:.0f} cm off; "
+                     "grasping at the simulation's position")
+            tx, ty = prod.x, prod.y
+            self._move_highest(arm, tx, ty, [top + 0.25, top + 0.15], self.timing["move_duration"])
+            self._move(arm, (tx, ty, top + 0.01), self.timing["move_duration"])
+            off = math.hypot(prod.x - tx, prod.y - ty)
         if off > self.timing["grasp_tolerance"]:
             self._move(arm, (tx, ty, top + 0.3), self.timing["move_duration"])
             raise MissedGrasp(f"vision put the product {off * 100:.0f} cm from where it is "
@@ -721,8 +797,17 @@ class PipelineLab:
             pick_conv = P.station(arm)["pick_conv"]
             pause = self.timing.get("pause_belt", "grasp")
             try:
-                guess = self._predict(st, det, seen, held_at)
-                target = self._remeasure(st, guess, after=held_at, label=det.label)
+                if getattr(det, "assisted", False):        # the simulation's position: no remeasure
+                    target = copy.copy(det)
+                    target.x, target.y = prod.x, prod.y
+                    if self.timing.get("locate") != "truth":
+                        self.assists[arm] = self.assists.get(arm, 0) + 1
+                        self.log(f"{arm}: assist #{self.assists[arm]}: the camera did not report {prod.ptype} at the arm; "
+                                 "using the simulation's position")
+                    guess = (prod.x, prod.y)
+                else:
+                    guess = self._predict(st, det, seen, held_at)
+                    target = self._remeasure(st, guess, after=held_at, label=det.label)
                 if target is None:                         # not seen again: grasp where vision predicted it
                     self.log(f"{arm}: #{st.number} not seen again after the hold; grasping at the predicted spot")
                     target = copy.copy(det)
@@ -917,6 +1002,9 @@ class PipelineLab:
         judged = [r.label_correct for r in rs if r.label_correct is not None]
         acc = f"{sum(judged)}/{len(judged)} = {100.0 * sum(judged) / len(judged):.0f}%" if judged else "n/a"
         lines = [f"{len(rs)} decisions: " + ", ".join(f"{k} {v}" for k, v in sorted(by.items())),
+                 f"arm locate mode {self.timing.get('locate')}: "
+                 + (", ".join(f"{a} {n}" for a, n in sorted(self.assists.items())) + " picks used the simulation's position"
+                    if self.assists else "every pick found by the camera"),
                  f"detector label correct (vs simulation truth): {acc}",
                  "where products are now: " + ", ".join(f"{k} {v}" for k, v in self.summary().items())]
         for r in rs[-30:]:
