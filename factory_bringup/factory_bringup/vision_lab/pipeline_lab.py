@@ -378,13 +378,16 @@ class PipelineLab:
                 for s in act:
                     bgr, dets, mask = s.view
                     v = s.pipe.draw(bgr, dets, status=f"station {s.arm}", arm_mask=mask, thumbnails=False)
-                    tiles.append(cv2.resize(v, (640, 360)))
+                    tiles.append(cv2.resize(v, (480, 270)))
                 cols = 1 if len(tiles) == 1 else (2 if len(tiles) <= 4 else 3)
                 while len(tiles) % cols:
                     tiles.append(np.zeros_like(tiles[0]))
                 grid = np.vstack([np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)])
                 cv2.imshow(win, grid)
-            cv2.waitKey(200)
+            for _ in range(10):                            # keep the window answering: pump events often
+                cv2.waitKey(50)
+                if self._closed.is_set():
+                    break
         cv2.destroyWindow(win)
 
     def wait_for_frame(self, timeout: float = 10.0, station: Optional[str] = None) -> bool:

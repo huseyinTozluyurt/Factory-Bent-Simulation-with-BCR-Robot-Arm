@@ -763,10 +763,15 @@ These settings make it lighter. The first three are on by default.
 | `PIPELINE_PHYSICS_STEP` | `0.004` s | Gazebo physics step (Gazebo's own default is 0.001). The lab moves products and arms itself, so a bigger step only saves CPU. |
 | `PIPELINE_LAZY_CAMERAS` | `1` | a station's detector only runs while a product is coming to its arm (idle stations take one picture every 2 s). `0` = detect on every frame. |
 | `--headless` | off | `./run_vision_lab.sh sim --world pipeline --headless`: Gazebo without its 3D window (the window costs the most GPU). Open the window later with `gz sim -g`; the lab's snapshots still work. |
+| `--drawn-cameras` | off | `./run_vision_lab.sh sim --world pipeline --drawn-cameras`: Gazebo renders no station cameras; the lab draws the camera images from the simulation state (as with `--fake`) while Gazebo shows the factory. Use it when Gazebo's real-time factor (bottom right) is far below 100%. |
+| `--nvidia` | off | `./run_vision_lab.sh sim --world pipeline --nvidia`: render on the NVIDIA GPU of a hybrid laptop. `libEGL warning: ... failed to create dri2 screen` means Gazebo fell back to slow software rendering. |
 | `--no-window` | window on | `./run_vision_lab.sh run LAB --no-window`: no Vision Lab camera window. |
 
 ```bash
-# lightest: headless Gazebo, small cameras
+# lightest: Gazebo renders no cameras (the lab draws them), no lab window
+./run_vision_lab.sh sim --world pipeline --drawn-cameras                     # terminal 1
+./run_vision_lab.sh run 12_arm_order --no-window                              # terminal 2
+# or headless Gazebo with small cameras
 PIPELINE_CAMERA=lite ./run_vision_lab.sh sim --world pipeline --headless       # terminal 1
 PIPELINE_CAMERA=lite ./run_vision_lab.sh run 11_all_boxes --no-window          # terminal 2
 ./run_vision_lab.sh check                                                       # pose update rate, camera

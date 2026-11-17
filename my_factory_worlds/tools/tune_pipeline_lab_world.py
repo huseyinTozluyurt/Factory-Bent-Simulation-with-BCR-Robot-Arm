@@ -44,11 +44,22 @@ def tune(path: str) -> str:
     elif "<physics" not in text:
         text = re.sub(r"(<world name=\"[^\"]*\">)", r"\1\n    " + physics, text, count=1)
 
+    # PIPELINE_CAMERAS=drawn: no camera rendering in Gazebo at all (the lab draws the station images)
+    drawn = os.environ.get("PIPELINE_CAMERAS", "").strip().lower() == "drawn"
+    off = re.search(r'<!-- lab-sensors-off (.*?) lab-sensors-off -->', text, flags=re.S)
+    sensors = re.search(r'<plugin filename="gz-sim-sensors-system".*?</plugin>',
+                        text.replace(off.group(0), "") if off else text, flags=re.S)
+    if drawn and sensors:
+        text = text.replace(sensors.group(0), f"<!-- lab-sensors-off {sensors.group(0)} lab-sensors-off -->", 1)
+    elif not drawn and off and not sensors:
+        text = text.replace(off.group(0), off.group(1), 1)
+    cams = "station cameras drawn by the lab (no Gazebo rendering)" if drawn else f"cameras {w}x{h} at {rate} Hz"
+
     if text != old:
         with open(path, "w") as f:
             f.write(text)
-        return f"{os.path.basename(path)}: cameras {w}x{h} at {rate} Hz, physics step {step:g} s (updated)"
-    return f"{os.path.basename(path)}: cameras {w}x{h} at {rate} Hz, physics step {step:g} s"
+        return f"{os.path.basename(path)}: {cams}, physics step {step:g} s (updated)"
+    return f"{os.path.basename(path)}: {cams}, physics step {step:g} s"
 
 
 if __name__ == "__main__":

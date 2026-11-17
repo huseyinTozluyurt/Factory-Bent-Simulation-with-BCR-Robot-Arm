@@ -20,6 +20,9 @@
 #   ./run_vision_lab.sh run LAB --fake --station A6 the same without Gazebo (drawn camera images)
 #   ./run_vision_lab.sh --world pipeline [LAB ...]  both: Gazebo in the background, then the lab
 #   ./run_vision_lab.sh sim --world pipeline --headless   Gazebo without its 3D window (much lighter; gz sim -g opens it)
+#   ./run_vision_lab.sh sim --world pipeline --drawn-cameras   no camera rendering in Gazebo: the lab draws the
+#                                                   station images from the simulation (lightest; Gazebo stays fast)
+#   ./run_vision_lab.sh sim --world pipeline --nvidia     render on the NVIDIA GPU of a hybrid (Intel/AMD + NVIDIA) laptop
 # Speed settings (pipeline world; use the same in both terminals):
 #   PIPELINE_CAMERA=balanced (default 960x540@4) | lite (640x360@3) | full (1280x720@5) | WxH@RATE
 #   PIPELINE_PHYSICS_STEP=0.004 (default; 0.001 = Gazebo's)   PIPELINE_LAZY_CAMERAS=1 (default; 0 = always detect)
@@ -95,7 +98,8 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
     echo "Note: the lab needs the gz-transport Python bindings (sudo apt install python3-gz-transport13 python3-gz-msgs10"
     echo "      from packages.osrfoundation.org, see COMMANDS.md). Without them use: $0 run LAB --fake"
   fi
-  # camera size / rate (PIPELINE_CAMERA) and physics step (PIPELINE_PHYSICS_STEP) for speed, in place
+  # camera size / rate (PIPELINE_CAMERA), drawn cameras and physics step (PIPELINE_PHYSICS_STEP), in place
+  for a in "$@"; do [[ "$a" == --drawn-cameras ]] && export PIPELINE_CAMERAS=drawn; done
   python3 "$PROJECT_DIR/my_factory_worlds/tools/tune_pipeline_lab_world.py" "$world_file" || true
   export GZ_SIM_RESOURCE_PATH="$share${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
   if pgrep -f "gz sim" > /dev/null; then
@@ -104,7 +108,16 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
   fi
   local gz_args=() headless=false
   for a in "$@"; do
-    if [[ "$a" == --headless ]]; then headless=true; else gz_args+=("$a"); fi
+    case "$a" in
+      --headless) headless=true ;;
+      --drawn-cameras) ;;                                  # handled before tuning the world
+      --nvidia)                                            # render on the NVIDIA GPU (hybrid laptops)
+        export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia
+        [ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] && \
+          export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+        echo "Rendering on the NVIDIA GPU (PRIME offload)" ;;
+      *) gz_args+=("$a") ;;
+    esac
   done
   if $headless; then
     echo "Pipeline lab world in Gazebo, headless (no 3D window). Start a lab in another terminal:  $0 run LAB"
@@ -117,7 +130,7 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
 
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
   sim)
     shift
     world=dual; rest=()

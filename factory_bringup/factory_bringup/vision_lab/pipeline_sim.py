@@ -132,6 +132,13 @@ class GzBackend:
         self._last_image = 0.0
         self._bridge = None                         # ros_gz_bridge process, when the bindings get no images
         self._ros = None                            # (rclpy node, executor thread) of that fallback
+        # PIPELINE_CAMERAS=drawn: Gazebo shows the factory, but the station camera images are drawn by the
+        # lab from the engine state (as with --fake). No camera rendering in Gazebo: far lighter on a PC
+        # without a working GPU. auto (default): Gazebo's cameras, drawn ones if no image arrives.
+        import os
+        self.camera_mode = os.environ.get("PIPELINE_CAMERAS", "auto").strip().lower()
+        self._drawn: Optional["FakeBackend"] = FakeBackend() if self.camera_mode == "drawn" else None
+        self._engine = None
 
     def running(self) -> bool:
         try:
@@ -205,6 +212,7 @@ class GzBackend:
 
     def _send_loop(self):
         while True:
+            t0 = time.time()
             with self._pending_cv:
                 while not self._pending:
                     self._pending_cv.wait()
@@ -217,6 +225,7 @@ class GzBackend:
                     time.sleep(0.05)
             except Exception:
                 time.sleep(0.2)
+            time.sleep(max(0.0, 1.0 / 30 - (time.time() - t0)))    # at most 30 updates per second
 
     def _send(self, poses) -> bool:
         if self.pose_vector_ok:
@@ -253,6 +262,9 @@ class GzBackend:
         Image = self.m["Image"]
 
         self._cams.append((topic, callback, wanted))
+        if self._drawn is not None:
+            self._drawn.subscribe_camera(topic, callback)
+            return
 
         def on_image(msg):
             self._last_image = time.time()
@@ -272,9 +284,22 @@ class GzBackend:
         bindings next to ROS's own Gazebo: requests work, subscriptions stay silent), receive the
         images through ros_gz_bridge + rclpy instead. PIPELINE_CAMERA_BRIDGE=1 forces it, =0 forbids it."""
         import os
+        if self._drawn is not None:
+            log("station cameras: drawn by the lab from the simulation state (PIPELINE_CAMERAS=drawn)")
+            return "drawn"
         mode = os.environ.get("PIPELINE_CAMERA_BRIDGE", "auto").strip().lower()
         if not self._cams or mode in ("0", "off", "no"):
             return "gz-transport"
+        if self.camera_mode == "auto":
+            try:
+                topics = self.node.topic_list()
+            except Exception:
+                topics = None
+            if topics is not None and self._cams[0][0] not in topics:
+                log("Gazebo has no station cameras (started with --drawn-cameras): "
+                    "drawing them from the simulation state")
+                self.use_drawn()
+                return "drawn"
         if mode not in ("1", "on", "yes"):
             end = time.time() + timeout
             while time.time() < end and self._last_image == 0.0:
@@ -327,10 +352,35 @@ class GzBackend:
         first = self._last_image
         while time.time() < end and self._last_image == first:
             time.sleep(0.2)
-        log("camera images arrive through ros_gz_bridge" if self._last_image != first else
-            "still no camera image through ros_gz_bridge either: check  gz topic -e -t /pipeline/A1/camera -n 1")
+        if self._last_image != first:
+            log("camera images arrive through ros_gz_bridge")
+        elif self.camera_mode == "auto":
+            log("no camera image through ros_gz_bridge either (is Gazebo very slow, or started with "
+                "--drawn-cameras?): drawing the station cameras from the simulation state instead")
+            self.use_drawn()
+        else:
+            log("still no camera image through ros_gz_bridge either: check  gz topic -e -t /pipeline/A1/camera -n 1")
+
+    def use_drawn(self):
+        """Switch to drawn station cameras (the Gazebo images are ignored from now on)."""
+        self._drawn = FakeBackend()
+        for topic, callback, wanted in self._cams:
+            self._drawn.subscribe_camera(topic, callback)
+        if self._engine is not None:
+            self._drawn.tick(self._engine)
+
+    @property
+    def active(self):
+        return self._drawn.active if self._drawn is not None else None
+
+    @active.setter
+    def active(self, value):
+        if self._drawn is not None:
+            self._drawn.active = value
 
     def close(self):
+        if self._drawn is not None:
+            self._drawn.close()
         if self._ros is not None:
             node, ex, _th = self._ros
             try:
@@ -346,7 +396,9 @@ class GzBackend:
                 self._bridge.kill()
 
     def tick(self, engine):
-        pass
+        self._engine = engine
+        if self._drawn is not None:
+            self._drawn.tick(engine)
 
 
 class FakeBackend:
