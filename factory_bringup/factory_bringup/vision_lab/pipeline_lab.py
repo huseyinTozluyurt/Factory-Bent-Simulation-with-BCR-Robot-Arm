@@ -88,7 +88,8 @@ class PipelineLab:
                  backend: str = "gz", show_window: bool = True, record_dataset: Optional[str] = None,
                  record_options: Optional[Dict] = None, output_dir: Optional[str] = None,
                  belt_speed: float = L.BELT_SPEED, arm_params: Optional[Dict] = None, start: bool = True,
-                 feed: bool = True, feed_items: Optional[List[str]] = None, seed: Optional[int] = None, **_ignored):
+                 feed: bool = True, feed_items: Optional[List[str]] = None, seed: Optional[int] = None,
+                 lazy_cameras: Optional[bool] = None, **_ignored):
         self.station = station.upper()
         if self.station not in P.STATIONS:
             raise ValueError(f"unknown station {station}; stations: {', '.join(P.STATIONS)}")
@@ -120,6 +121,13 @@ class PipelineLab:
         self.feed_items = list(feed_items or PRODUCT_TYPES)
         self._feed_targets: set = set()
         self._rng = random.Random(seed)
+        # lazy cameras: a station's detector skips frames while nothing is coming to its arm (judged from
+        # the engine's product positions; it only decides WHEN to run the detector, never what it sees).
+        # PIPELINE_LAZY_CAMERAS=0 turns it off.
+        if lazy_cameras is None:
+            lazy_cameras = os.environ.get("PIPELINE_LAZY_CAMERAS", "1").strip().lower() not in ("0", "false", "no", "off")
+        self.lazy_cameras = lazy_cameras
+        self._size_warned: set = set()
         if start:
             self.start()
 
@@ -139,7 +147,10 @@ class PipelineLab:
             if isinstance(det, Detector) and a != self.station:
                 det = copy.deepcopy(det)
             self.stations[a] = _Station(self, a, det)
-            backend.subscribe_camera(P.camera_topic(a), self._camera_cb(a))
+            if isinstance(backend, GzBackend):
+                backend.subscribe_camera(P.camera_topic(a), self._camera_cb(a), wanted=self._frame_wanted(a))
+            else:
+                backend.subscribe_camera(P.camera_topic(a), self._camera_cb(a))
         self.sim.start()
         self.activate(self.station)
         self._spawn(self._feed_loop, "pipeline_lab_feeder")
@@ -214,8 +225,17 @@ class PipelineLab:
 
     # ------------------------------------------------------------------ vision
     def _camera_cb(self, arm: str):
+        want_w, want_h = P.station_profile(arm).camera_size
+
         def cb(bgr, t):
             st = self.stations[arm]
+            h, w = bgr.shape[:2]
+            if (w, h) != (want_w, want_h):                 # world built with another PIPELINE_CAMERA setting:
+                if arm not in self._size_warned:           # scale to the size the geometry expects
+                    self._size_warned.add(arm)
+                    self.log(f"{arm}: camera sends {w}x{h}, the lab expects {want_w}x{want_h} (PIPELINE_CAMERA); "
+                             "scaling the images. Use the same PIPELINE_CAMERA in both terminals.")
+                bgr = cv2.resize(bgr, (want_w, want_h), interpolation=cv2.INTER_LINEAR)
             with st.cond:
                 st.raw = (bgr, t)
                 st.cond.notify_all()
@@ -243,6 +263,11 @@ class PipelineLab:
                     continue
                 bgr, t = st.raw
             last = t
+            if self.lazy_cameras and st.pipe.ctx is not None and not self._needs_camera(st.arm):
+                with st.cond:                                  # nothing near this arm: no detector run
+                    st.latest = (t, [], bgr)
+                    st.cond.notify_all()
+                continue
             try:
                 if st.pipe.ctx is None:
                     st.pipe.process(bgr)                       # builds the lane masks
@@ -268,6 +293,35 @@ class PipelineLab:
                     self.log(f"on_frame callback failed: {exc}")
             if self._show_window:
                 st.view = (bgr, dets, mask)
+
+    def _frame_wanted(self, arm: str, idle_period: float = 2.0):
+        """For the Gazebo camera callback: take every frame of a busy station, one every idle_period s
+        of an idle one (so its picture stays fresh), and none of a station whose detector is off."""
+        last = [0.0]
+
+        def wanted() -> bool:
+            st = self.stations.get(arm)
+            if st is None or not st.active:
+                return st is not None and st.raw is None          # one frame, then only when activated
+            now = time.time()
+            if (not self.lazy_cameras or st.pipe.ctx is None or self._needs_camera(arm)
+                    or now - last[0] > idle_period):
+                last[0] = now
+                return True
+            return False
+        return wanted
+
+    def _needs_camera(self, arm: str, reach: float = 4.5) -> bool:
+        """Is anything happening at this arm: a product on its pick belt within `reach` m of the pick point
+        (about the camera's view), or the arm carrying one?"""
+        if self.sim is None:
+            return True
+        a = self.sim.arms.get(arm)
+        if a is not None and a.carrying:
+            return True
+        st = P.station(arm)
+        px, py = st["pick"]
+        return any(math.hypot(p.x - px, p.y - py) < reach for p in self.sim.on_conveyor(st["pick_conv"]))
 
     def _window_loop(self):
         win = "Vision Lab - pipeline"

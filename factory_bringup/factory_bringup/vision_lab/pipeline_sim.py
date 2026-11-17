@@ -243,10 +243,14 @@ class GzBackend:
         except Exception:
             return True
 
-    def subscribe_camera(self, topic: str, callback: Callable[[np.ndarray, float], None]):
+    def subscribe_camera(self, topic: str, callback: Callable[[np.ndarray, float], None],
+                         wanted: Optional[Callable[[], bool]] = None):
+        """wanted() False = drop the image before converting it (a station with nothing to do)."""
         Image = self.m["Image"]
 
         def on_image(msg):
+            if wanted is not None and not wanted():
+                return
             h, w = msg.height, msg.width
             data = np.frombuffer(msg.data, np.uint8)
             if data.size < h * w * 3:

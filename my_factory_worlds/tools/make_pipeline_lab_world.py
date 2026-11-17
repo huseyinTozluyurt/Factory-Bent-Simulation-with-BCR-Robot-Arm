@@ -143,6 +143,8 @@ def main():
         f.write(world)
     print(f"{OUT}: {removed} static arms replaced by {len(ARM.links)} link models each, "
           f"{len(P.STATIONS)} cameras, {2 * len(P.STATIONS)} bins")
+    from tune_pipeline_lab_world import tune          # camera size / rate and physics step for speed
+    print(tune(OUT))
 
 
 if __name__ == "__main__":

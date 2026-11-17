@@ -749,3 +749,28 @@ PIPELINE_TESTS=branch_on_C1 ./run_vision_lab.sh run 10_pipeline_tests --fake   #
 ./run_vision_lab.sh offline --world pipeline --synthetic 5  # detector metrics on the 12 station cameras
 cd my_factory_worlds/tools && python3 make_pipeline_lab_world.py   # rebuild the lab world after editing pipeline_layout.py
 ```
+
+### Making the pipeline simulation lighter
+
+The pipeline lab world is heavy: 12 station cameras, 12 arms of many link models and a big hall.
+These settings make it lighter. The first three are on by default.
+
+| setting | default | what it does |
+|---|---|---|
+| `PIPELINE_CAMERA` | `balanced` (960x540, 4 per second) | size and rate of the 12 station cameras. `lite` = 640x360 at 3/s (lightest), `full` = 1280x720 at 5/s (the old setting), or e.g. `800x450@3`. Use the same value in both terminals. |
+| `PIPELINE_PHYSICS_STEP` | `0.004` s | Gazebo physics step (Gazebo's own default is 0.001). The lab moves products and arms itself, so a bigger step only saves CPU. |
+| `PIPELINE_LAZY_CAMERAS` | `1` | a station's detector only runs while a product is coming to its arm (idle stations take one picture every 2 s). `0` = detect on every frame. |
+| `--headless` | off | `./run_vision_lab.sh sim --world pipeline --headless`: Gazebo without its 3D window (the window costs the most GPU). Open the window later with `gz sim -g`; the lab's snapshots still work. |
+| `--no-window` | window on | `./run_vision_lab.sh run LAB --no-window`: no Vision Lab camera window. |
+
+```bash
+# lightest: headless Gazebo, small cameras
+PIPELINE_CAMERA=lite ./run_vision_lab.sh sim --world pipeline --headless       # terminal 1
+PIPELINE_CAMERA=lite ./run_vision_lab.sh run 11_all_boxes --no-window          # terminal 2
+./run_vision_lab.sh check                                                       # pose update rate, camera
+```
+
+On synthetic camera images the detector finds every product at all three camera sizes. Label
+accuracy was 94% (full), 97% (balanced) and 92% (lite), and the CPU per frame was about 20, 12 and
+7 ms. `run_vision_lab.sh sim` writes the camera and physics settings into
+`pipeline_factory_lab.sdf` before it starts (`my_factory_worlds/tools/tune_pipeline_lab_world.py`).

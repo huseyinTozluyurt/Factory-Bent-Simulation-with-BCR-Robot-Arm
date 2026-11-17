@@ -126,3 +126,6 @@ station cameras are saved next to it. The lab exits with status 1 when the test 
 While an arm grasps a product, the belt it picks from stands still (and nothing is spawned on it);
 while it places a product on its bent 2, that belt stands still. `--arm pause_belt=cycle` keeps the
 pick belt still for the whole pick and delivery, `--arm pause_belt=off` never stops a belt.
+
+The pipeline world is heavy for a PC; see "Making the pipeline simulation lighter" in COMMANDS.md
+(`--headless`, `PIPELINE_CAMERA=lite`, lazy cameras, a larger physics step).

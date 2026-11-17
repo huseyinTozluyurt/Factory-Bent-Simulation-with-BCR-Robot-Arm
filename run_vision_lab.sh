@@ -19,6 +19,10 @@
 #   ./run_vision_lab.sh run LAB --station A2        a lab at arm A2 (found running; or add --world pipeline)
 #   ./run_vision_lab.sh run LAB --fake --station A6 the same without Gazebo (drawn camera images)
 #   ./run_vision_lab.sh --world pipeline [LAB ...]  both: Gazebo in the background, then the lab
+#   ./run_vision_lab.sh sim --world pipeline --headless   Gazebo without its 3D window (much lighter; gz sim -g opens it)
+# Speed settings (pipeline world; use the same in both terminals):
+#   PIPELINE_CAMERA=balanced (default 960x540@4) | lite (640x360@3) | full (1280x720@5) | WxH@RATE
+#   PIPELINE_PHYSICS_STEP=0.004 (default; 0.001 = Gazebo's)   PIPELINE_LAZY_CAMERAS=1 (default; 0 = always detect)
 # "sim" is run_factory.sh without the standard detector and pick-and-place controller (the lab brings its
 # own): run_factory.sh --world W ... run_detector:=false run_controller:=false. Its order window, --no-select,
 # --world-products and --build work as there.
@@ -91,18 +95,29 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
     echo "Note: the lab needs the gz-transport Python bindings (sudo apt install python3-gz-transport13 python3-gz-msgs10"
     echo "      from packages.osrfoundation.org, see COMMANDS.md). Without them use: $0 run LAB --fake"
   fi
+  # camera size / rate (PIPELINE_CAMERA) and physics step (PIPELINE_PHYSICS_STEP) for speed, in place
+  python3 "$PROJECT_DIR/my_factory_worlds/tools/tune_pipeline_lab_world.py" "$world_file" || true
   export GZ_SIM_RESOURCE_PATH="$share${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
   if pgrep -f "gz sim" > /dev/null; then
     echo "Gazebo is already running (another simulation?). Close it first."
     exit 1
   fi
+  local gz_args=() headless=false
+  for a in "$@"; do
+    if [[ "$a" == --headless ]]; then headless=true; else gz_args+=("$a"); fi
+  done
+  if $headless; then
+    echo "Pipeline lab world in Gazebo, headless (no 3D window). Start a lab in another terminal:  $0 run LAB"
+    echo "To look at it later without restarting:  gz sim -g"
+    exec gz sim -s -r "$world_file" "${gz_args[@]}"
+  fi
   echo "Pipeline lab world in Gazebo; start a lab in another terminal:  $0 run LAB --station A1"
-  exec gz sim -r "$world_file" "$@"
+  exec gz sim -r "$world_file" "${gz_args[@]}"
 }
 
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
   sim)
     shift
     world=dual; rest=()
