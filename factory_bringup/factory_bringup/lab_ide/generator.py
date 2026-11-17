@@ -134,7 +134,6 @@ def _run_lines(key: str, file_name: str, pipeline: bool) -> str:
 
 def _pipeline_starter(info: Dict, name: str, title: str, file_name: str) -> str:
     key = info["key"]
-    tree = info.get("layout") == "tree"
     share = [a["name"] for a in info["arms"] if a["rule"] == "share"]
     st_lines, plan_lines = [], []
     for a in info["arms"]:
