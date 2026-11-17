@@ -293,10 +293,13 @@ def cmd_worlds(_a) -> int:
         print(w.describe())
     for k, why in UNSUPPORTED.items():
         print(f"{k:18s} (not supported) {why}")
-    from factory_bringup.vision_lab.pipeline_world import describe
-    print("\npipeline (pipeline_factory_lab.sdf): one profile per arm station, --world pipeline:A1 ... pipeline:A12\n"
+    from factory_bringup.vision_lab.pipeline_world import SDF, WORLD_KEY, describe
+    print(f"\n{WORLD_KEY} ({SDF}): one profile per arm station, --world {WORLD_KEY}:A1 ... {WORLD_KEY}:A12\n"
           "  bent 1 = the conveyor the arm picks from, bent 2 = the one it places on, own trash and recycling bins")
     print("  " + describe().replace("\n", "\n  "))
+    if WORLD_KEY == "pipeline":
+        print("\npipeline-tree (pipeline_tree_factory_lab.sdf): the same 13 bents and 12 arms as a tree of three, "
+              "S1 feeds A1, A2, A3\n  (vision_lab worlds --world pipeline-tree lists its stations)")
     return 0
 
 
@@ -315,7 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(p):
         p.add_argument("--world", help="dual, circular, straight, straight-circular, circular-straight, "
-                                       "straight-straight, pipeline, pipeline:A1 ... pipeline:A12 "
+                                       "straight-straight, pipeline, pipeline:A1 ... pipeline:A12, "
+                                       "pipeline-tree (S1 feeds three arms, a tree of three), pipeline-tree:A1 ... "
                                        "(run: default = the running simulation's; offline: also all)")
         p.add_argument("--detector", help="opencv_contours (default), opencv_color, opencv_bgsub, yolo, "
                                           "module:Class or file.py:Class")
@@ -365,7 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     li.add_argument("--dir", help="labs folder (default $VISION_LAB_DIR or ./labs)")
     li.set_defaults(func=cmd_list)
     sub.add_parser("templates", help="templates for new lab files").set_defaults(func=cmd_templates)
-    sub.add_parser("worlds", help="the worlds and what the arm can do in each").set_defaults(func=cmd_worlds)
+    w = sub.add_parser("worlds", help="the worlds and what the arm can do in each")
+    w.add_argument("--world", help="pipeline (default) or pipeline-tree: whose arm stations to list")
+    w.set_defaults(func=cmd_worlds)
     sub.add_parser("detectors", help="the available detectors").set_defaults(func=cmd_detectors)
     return ap
 
@@ -380,6 +386,16 @@ def main(argv=None) -> int:
     if not getattr(a, "cmd", None):
         ap.print_help()
         return 0
+    if getattr(a, "world", None):           # pipeline / pipeline-tree: pick the layout before anything loads it
+        from factory_bringup.vision_lab.worlds import use_pipeline_layout
+        use_pipeline_layout(a.world)
+    elif a.cmd == "run" and not getattr(a, "fake", False) and not os.environ.get("PIPELINE_LAYOUT"):
+        from factory_bringup.vision_lab.worlds import detect_running_pipeline_layout
+        running = detect_running_pipeline_layout()       # the tree world running in Gazebo: use its layout
+        if running:
+            os.environ["PIPELINE_LAYOUT"] = running
+            if running == "tree":
+                print("[vision_lab] the tree-of-three pipeline world is running: using its layout (pipeline-tree)")
     return a.func(a)
 
 

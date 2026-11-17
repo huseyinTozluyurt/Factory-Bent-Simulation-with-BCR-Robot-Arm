@@ -781,3 +781,40 @@ On synthetic camera images the detector finds every product at all three camera 
 accuracy was 94% (full), 97% (balanced) and 92% (lite), and the CPU per frame was about 20, 12 and
 7 ms. `run_vision_lab.sh sim` writes the camera and physics settings into
 `pipeline_factory_lab.sdf` before it starts (`my_factory_worlds/tools/tune_pipeline_lab_world.py`).
+
+## Tree-of-three pipeline world: S1 feeds three arms
+
+`pipeline_tree_factory_lab.sdf` has the same parts as the pipeline world (13 bents, 12 BCR arms, a
+camera and two bins per arm), laid out as a tree of three: the inbound conveyor S1 feeds three arms,
+each arm feeds a sorting ring, and each ring feeds three output lines that end over a dock box.
+A complete ternary tree of depth 2 has 1 + 3 + 9 = 13 bents and 3 + 9 = 12 arms, the same numbers.
+
+```
+S1 inbound -A1 (share)-> C1 -A4 large -> S2 -> dock 1 | -A5 small -> S3 -> dock 2 | -A6 rest -> S4  -> dock 3
+           -A2 (share)-> C2 -A7 large -> S5 -> dock 4 | -A8 small -> S6 -> dock 5 | -A9 rest -> S7  -> dock 6
+           -A3 (rest)--> C3 -A10 large -> S8 -> dock 7 | -A11 small -> S9 -> dock 8 | -A12 rest -> S10 -> dock 9
+```
+
+A1 and A2 stand beside S1, A3 at its end. With the layout rules (`lab.run(stations="all")`, rule
+`share`) the three S1 arms share the products, each branch about a third; A3 takes what the other two
+let pass. Lab 11 shares them by need, lab 12 by fair share (`SHARE_TREE`, also on the rings).
+The layout is `factory_bringup/pipeline_tree_layout.py`; `PIPELINE_LAYOUT=tree` (set by
+`--world pipeline-tree`) makes `pipeline_layout.py` use it. The lab finds the running world by itself.
+
+![Tree-of-three layout](docs/images/pipeline_tree_layout.png)
+
+```bash
+cd ~/ros2_ws && colcon build --packages-select factory_bringup --symlink-install && source install/setup.bash
+cd ~/ros2_ws/src/factory_bent_project
+./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras     # terminal 1: Gazebo, cameras drawn by the lab
+./run_vision_lab.sh check                                          # terminal 2, once: spawn / move / camera
+./run_vision_lab.sh run 11_all_boxes                               # terminal 2: 70 products, all 33 boxes
+./run_vision_lab.sh run 12_arm_order                               # terminal 2: every arm in its own order
+./run_vision_lab.sh run 08_pipeline_sorting                        # every arm by its layout rule (share, large, small)
+./run_vision_lab.sh run 11_all_boxes --world pipeline-tree --fake --belt-speed 0.8   # without Gazebo
+./run_vision_lab.sh worlds --world pipeline-tree                   # the 12 stations, their rules and bins
+# rebuild the worlds after editing pipeline_tree_layout.py
+cd my_factory_worlds/tools && PIPELINE_LAYOUT=tree python3 make_pipeline_world.py --out ../worlds \
+  && PIPELINE_LAYOUT=tree python3 make_pipeline_lab_world.py
+```
+

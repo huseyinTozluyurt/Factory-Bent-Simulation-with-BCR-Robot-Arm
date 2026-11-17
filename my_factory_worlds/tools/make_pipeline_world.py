@@ -2,19 +2,34 @@
 pipeline_layout.py: straight transport conveyors, circular selection conveyors copied from the
 dual world, 12 BCR arms posed over their pick points, dock boxes, a hall and floor labels.
 
-Run next to pipeline_layout.py, urdf_ik.py, arm.urdf (the BCR arm's robot_description) and
-dual.sdf (a copy of dual_circular_factory_conveyor.sdf):
+Run in this folder (next to urdf_ik.py and arm.urdf, the BCR arm's robot_description); the layout comes
+from factory_bringup/pipeline_layout.py (or a pipeline_layout.py copy here), the circular conveyors from
+dual.sdf here or ../worlds/dual_circular_factory_conveyor.sdf:
     python3 make_pipeline_world.py            -> pipeline_factory.sdf
-    python3 make_pipeline_world.py --preview  -> pipeline_preview.sdf (arms as plain cylinders, for renders)"""
-import math, re, sys
+    python3 make_pipeline_world.py --preview  -> pipeline_preview.sdf (arms as plain cylinders, for renders)
+    PIPELINE_LAYOUT=tree python3 make_pipeline_world.py
+                                              -> pipeline_tree_factory.sdf (the tree-of-three layout)
+    --out DIR writes the world into DIR (default: this folder)"""
+import math, os, re, sys
 import xml.etree.ElementTree as ET
 import numpy as np
-import pipeline_layout as L
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+if not os.path.isfile(os.path.join(HERE, "pipeline_layout.py")):
+    sys.path.insert(1, os.path.join(HERE, "..", "..", "factory_bringup"))
+    from factory_bringup import pipeline_layout as L
+else:
+    import pipeline_layout as L
 from urdf_ik import UrdfChain
 
 PREVIEW = "--preview" in sys.argv
-DUAL = open("dual.sdf").read()
-URDF = open("arm.urdf").read()
+OUT_DIR = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv[1:-1] else "."
+_dual = os.path.join(HERE, "dual.sdf")
+if not os.path.isfile(_dual):
+    _dual = os.path.join(HERE, "..", "worlds", "dual_circular_factory_conveyor.sdf")
+DUAL = open(_dual).read()
+URDF = open(os.path.join(HERE, "arm.urdf")).read()
 
 
 def mat(c, emissive=None):
@@ -290,7 +305,7 @@ def hall():
             m.box(x, y, 4.0, 0.4, 0.4, 8.0, (0.26, 0.29, 0.33))
         x += 8
     # walkway lines between the lines and loops
-    for y in (-11.0, 11.0):
+    for y in getattr(L, "WALKWAYS_Y", (-11.0, 11.0)):
         m.box(cx, y, 0.008, w - 2, 0.12, 0.004, YELLOW)
     return m.sdf()
 
@@ -302,7 +317,7 @@ LIGHTS = "".join(f"""    <light name="hall_light_{i}" type="point">
       <attenuation><range>18</range><constant>0.4</constant><linear>0.05</linear><quadratic>0.005</quadratic></attenuation>
       <cast_shadows>false</cast_shadows>
     </light>
-""" for i, (x, y) in enumerate((x, y) for x in (-14, 6, 26) for y in (-16, 0, 16)))
+""" for i, (x, y) in enumerate(getattr(L, "LIGHTS", None) or [(x, y) for x in (-14, 6, 26) for y in (-16, 0, 16)]))
 
 
 def world():
@@ -347,7 +362,7 @@ def world():
 """ + "".join(parts) + "  </world>\n</sdf>\n"
 
 
-out = "pipeline_preview.sdf" if PREVIEW else "pipeline_factory.sdf"
+out = os.path.join(OUT_DIR, "pipeline_preview.sdf" if PREVIEW else getattr(L, "BASE_SDF", "pipeline_factory.sdf"))
 text = world()
 assert "--" not in "".join(re.findall(r"<!--(.*?)-->", text, re.S)), "a comment contains --"
 ET.fromstring(text.split("?>", 1)[1])                                  # well-formed

@@ -151,6 +151,15 @@ arms pick from (S1 for the whole factory); `--no-feed` turns that off, `--belt-s
 `--dry-run` and `set_motion` have no effect there. Not tested in Gazebo yet: the rendering of the
 station cameras and posing the arm links with `set_pose_vector` (tested with the `--fake` backend).
 
+### Tree-of-three world (`--world pipeline-tree`)
+
+`pipeline_tree_layout.py` lays the same 13 bents and 12 arms out as a tree of three: S1 feeds A1, A2
+(beside S1) and A3 (at its end), each feeds a ring C1 / C2 / C3, and each ring feeds three output lines
+with docks. `PIPELINE_LAYOUT=tree` (set from `--world pipeline-tree`, or found running in Gazebo)
+makes `pipeline_layout.py`, `pipeline_world.py`, the lab and the world tools use it. New layout rule
+`share`: the arms picking from one conveyor share its products (an arm takes a product while it has
+sent no more than its fair share onto its bent 2, else lets it pass); the last arm on the conveyor has `all`.
+
 ### Pipeline test cases
 
 `pipeline_testing.py` runs test cases on a `PipelineLab`: `PipelineCase(name, items, routing)` puts

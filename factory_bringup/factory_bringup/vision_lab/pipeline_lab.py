@@ -1,6 +1,7 @@
 """
-PipelineLab: the vision lab in the pipeline world (pipeline_factory_lab.sdf): 13 conveyors, 12 BCR
-arm stations A1 ... A12, each with its own camera, recycling bin and trash bin.
+PipelineLab: the vision lab in the pipeline world (pipeline_factory_lab.sdf) and in the tree-of-three
+world (pipeline_tree_factory_lab.sdf, --world pipeline-tree): 13 conveyors, 12 BCR arm stations
+A1 ... A12, each with its own camera, recycling bin and trash bin.
 
 It has the same calls as VisionLab, so a lab file runs in every world. In the pipeline they act on
 one station: `station=` picks it, otherwise lab.station (the --station option, default A1).
@@ -149,8 +150,8 @@ class PipelineLab:
             return self
         backend = FakeBackend() if self._backend_name == "fake" else GzBackend()
         if not backend.running():
-            raise RuntimeError("The pipeline lab world is not running in Gazebo. Start it with\n"
-                               "  ./run_vision_lab.sh sim --world pipeline\n"
+            raise RuntimeError(f"The {P.WORLD_KEY} lab world ({P.WORLD_NAME}) is not running in Gazebo. Start it with\n"
+                               f"  ./run_vision_lab.sh sim --world {P.WORLD_KEY} --drawn-cameras\n"
                                "or try the lab without Gazebo: --fake")
         self.sim = PipelineSim(backend, self.belt_speed)
         self.sim.log = self.log
@@ -914,12 +915,46 @@ class PipelineLab:
         d = ctx.detection
         if rule == "all":
             return "bent2"
+        if rule == "share":                          # tree world: the S1 arms share the products evenly
+            return "bent2" if PipelineLab._share_turn(ctx.lab, ctx.station) else "skip"
         if d is None:
             return "skip"
         size = max(d.size_x or 0.0, d.size_y or 0.0)
         ok = {"recyclable": d.label in RECYCLABLE, "cardboard": d.label in CARDBOARD,
               "not_large": size < LARGE_M, "large": size >= LARGE_M, "small": size <= SMALL_M}.get(rule, True)
         return "bent2" if ok else "skip"
+
+    @staticmethod
+    def share_turn(lab, arm: str, picks: Dict[str, int]) -> bool:
+        """Is it `arm`'s turn on a conveyor that n arms share? picks = products each arm took so far.
+        On a straight (S1 of the tree world) an arm takes 1/n of the products that have reached it: it
+        counts every product that came past its pick point, also while it was busy, and catches up when it
+        is free again; the last arm of the straight takes all the others. On a ring (products come round
+        again) an arm takes a product while it has taken no more than 1/n of what the ring's arms took
+        (counting the ones in a gripper)."""
+        conv = P.station(arm)["pick_conv"]
+        group = [a for a in P.STATIONS if P.station(a)["pick_conv"] == conv]
+        if len(group) < 2 or lab is None or getattr(lab, "sim", None) is None:
+            return True
+        sim = lab.sim
+        if not P.is_ring(conv):
+            s_pick = P.path_s(conv, *P.station(arm)["pick"])
+            with sim.lock:
+                upstream = sum(1 for p in sim.products.values()
+                               if p.state == "belt" and p.conv == conv and p.s < s_pick - 0.6)
+                reached = len(sim.products) - upstream   # this one included
+            return picks.get(arm, 0) * len(group) < reached
+        count = lambda a: picks.get(a, 0) + (1 if a != arm and sim.arms[a].carrying else 0)  # noqa: E731
+        return count(arm) * len(group) <= sum(count(a) for a in group)
+
+    @staticmethod
+    def _share_turn(lab, arm: str) -> bool:
+        """Rule "share" (see share_turn), counting the products each arm sent onto its bent 2."""
+        picks: Dict[str, int] = {}
+        for r in (lab.results if lab is not None else []):
+            if r.status == "delivered" and r.destination == "bent2":
+                picks[r.station] = picks.get(r.station, 0) + 1
+        return PipelineLab.share_turn(lab, arm, picks)
 
     def run(self, policy: Union[Callable[[PickContext], str], Dict[str, str], str, None] = None,
             count: Optional[int] = None, timeout: Optional[float] = None, by: str = "label",
