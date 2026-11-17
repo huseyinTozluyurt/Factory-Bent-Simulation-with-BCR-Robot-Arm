@@ -22,6 +22,10 @@ How the arms decide (pipeline_testing.AllBoxesPolicy):
   down still need products; otherwise into an empty bin of the station; otherwise the arm leaves it.
   once all boxes have one: every product goes on to the docks, spread over the 5 docks.
 
+Tree-of-three world (S1 feeds A1, A2, A3; 33 boxes: 24 bins + Dock 1 ... Dock 9):
+      ./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras   (terminal 1)
+      ./run_vision_lab.sh run 11_all_boxes --world pipeline-tree      (terminal 2)
+
 Run:  ./run_vision_lab.sh sim --world pipeline                (terminal 1)
       ./run_vision_lab.sh check                               (once: can the lab spawn / move / see in Gazebo?)
       ./run_vision_lab.sh run 11_all_boxes                    (terminal 2)
@@ -51,10 +55,12 @@ BELT_SPEED = None                     # m/s for this test (None = the lab's, i.e
 
 def main(lab):
     if not hasattr(lab, "all_stations"):
-        raise SystemExit("This test is for the pipeline world: add --world pipeline (or --fake)")
+        raise SystemExit("This test is for the pipeline worlds: add --world pipeline or --world pipeline-tree (or --fake)")
+    from factory_bringup import pipeline_layout as L
+    from factory_bringup.vision_lab.pipeline_testing import all_boxes
     decide_by = os.environ.get("PIPELINE_DECIDE_BY", "label")
-    print(f"All-boxes test: {COUNT} products on S1, 13 bents, 12 arms, 29 boxes; decisions by {decide_by}; "
-          f"limit {TIMEOUT:.0f} s", flush=True)
+    print(f"All-boxes test ({L.WORLD_NAME}): {COUNT} products on S1, {len(L.STRAIGHTS) + len(L.CIRCLES)} bents, "
+          f"{len(L.ARMS)} arms, {len(all_boxes())} boxes; decisions by {decide_by}; limit {TIMEOUT:.0f} s", flush=True)
     lab.on_result(lambda r: r.status != "skipped" and print(
         f"    {r.station:3s} #{r.number}: {r.label or '?':18s} -> {r.destination:9s} {r.status:9s} "
         f"(truth {r.product_type})", flush=True))

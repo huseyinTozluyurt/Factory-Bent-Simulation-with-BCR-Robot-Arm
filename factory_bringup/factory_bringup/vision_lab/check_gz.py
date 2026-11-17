@@ -6,13 +6,25 @@ It tests, one by one: the gz-transport Python bindings, the world's services, sp
 (Python bindings, then the gz command line), moving it with set_pose_vector, one station camera image,
 and removing the product again. Each line says OK or what failed.
 """
+import os
 import sys
 import time
 
-from factory_bringup.vision_lab import pipeline_world as P
+P = None                     # pipeline_world, imported in main() once the layout is known
 
 
 def main() -> int:
+    global P
+    if "--world" in sys.argv[1:-1]:                   # check --world pipeline-tree
+        from factory_bringup.vision_lab.worlds import use_pipeline_layout
+        use_pipeline_layout(sys.argv[sys.argv.index("--world") + 1])
+    elif not os.environ.get("PIPELINE_LAYOUT"):
+        from factory_bringup.vision_lab.worlds import detect_running_pipeline_layout
+        running = detect_running_pipeline_layout()
+        if running:
+            os.environ["PIPELINE_LAYOUT"] = running
+    from factory_bringup.vision_lab import pipeline_world
+    P = pipeline_world
     ok_all = True
 
     def line(ok, text):
@@ -20,7 +32,7 @@ def main() -> int:
         ok_all &= bool(ok)
         print(f"  [{'OK  ' if ok else 'FAIL'}] {text}", flush=True)
 
-    print("Vision lab <-> Gazebo check (pipeline world)")
+    print(f"Vision lab <-> Gazebo check ({P.WORLD_KEY} world, {P.WORLD_NAME})")
     try:
         from factory_bringup.vision_lab.pipeline_sim import GzBackend, BELT_TOP
         gz = GzBackend()
@@ -30,7 +42,7 @@ def main() -> int:
         line(False, str(exc))
         return 1
     if not gz.running():
-        line(False, f"no /world/{P.WORLD_NAME}/... services: start ./run_vision_lab.sh sim --world pipeline first")
+        line(False, f"no /world/{P.WORLD_NAME}/... services: start ./run_vision_lab.sh sim --world {P.WORLD_KEY} first")
         return 1
     line(True, f"world {P.WORLD_NAME} is running")
 

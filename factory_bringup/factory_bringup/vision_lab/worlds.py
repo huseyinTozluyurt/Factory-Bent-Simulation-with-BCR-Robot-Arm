@@ -111,11 +111,57 @@ ALIASES = {"circular-circular": "dual", "dual_circular": "dual", "single": "circ
 
 PIPELINE_KEYS = ("pipeline", "pipeline_factory", "pipeline_factory_world", "pipeline_factory_lab",
                  "pipeline_factory.sdf", "pipeline_factory_lab.sdf", "pipeline_factory.sh")
+# the tree-of-three pipeline world (pipeline_tree_layout.py): S1 feeds three arms
+PIPELINE_TREE_KEYS = ("pipeline-tree", "pipeline_tree", "tree", "tree3", "pipeline-tree3", "pipeline_tree_world",
+                      "pipeline_tree_factory", "pipeline_tree_factory_lab", "pipeline_tree_factory.sdf",
+                      "pipeline_tree_factory_lab.sdf")
+
+
+def pipeline_layout_of(key_or_name: Optional[str]) -> Optional[str]:
+    """'tree' or 'pipeline' for a pipeline world key (pipeline-tree:A4 ...), None for the other worlds.
+    (No import of pipeline_layout here: the caller sets PIPELINE_LAYOUT from it before that import.)"""
+    k = os.path.basename(str(key_or_name or "")).split(":")[0]
+    if k in PIPELINE_TREE_KEYS:
+        return "tree"
+    if k in PIPELINE_KEYS:
+        return "pipeline"
+    return None
+
+
+def detect_running_pipeline_layout(timeout: float = 6.0) -> Optional[str]:
+    """'tree' / 'pipeline' when that pipeline world runs in Gazebo (from `gz service -l`), else None."""
+    import shutil
+    import subprocess
+    if not shutil.which("gz"):
+        return None
+    try:
+        out = subprocess.run(["gz", "service", "-l"], capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return None
+    if "/world/pipeline_tree_world/" in out:
+        return "tree"
+    if "/world/pipeline_factory_world/" in out:
+        return "pipeline"
+    return None
+
+
+def use_pipeline_layout(key_or_name: Optional[str]) -> Optional[str]:
+    """Select the pipeline layout of a --world key (sets PIPELINE_LAYOUT; must run before pipeline_layout is
+    imported). Returns the layout, or None when the key is not a pipeline world."""
+    import sys
+    layout = pipeline_layout_of(key_or_name)
+    if layout is None:
+        return None
+    loaded = sys.modules.get("factory_bringup.pipeline_layout")
+    if loaded is not None and getattr(loaded, "LAYOUT", layout) != layout:
+        raise RuntimeError(f"the {loaded.LAYOUT} pipeline layout is already loaded; set PIPELINE_LAYOUT={layout} "
+                           "before starting Python, or pass --world on the command line")
+    os.environ["PIPELINE_LAYOUT"] = layout
+    return layout
 
 
 def is_pipeline(key_or_name: Optional[str]) -> bool:
-    k = os.path.basename(str(key_or_name or os.environ.get(WORLD_ENV) or "")).split(":")[0]
-    return k in PIPELINE_KEYS
+    return pipeline_layout_of(key_or_name or os.environ.get(WORLD_ENV)) is not None
 
 
 def list_worlds(include_pipeline: bool = False) -> List[WorldProfile]:
@@ -135,6 +181,8 @@ def get_world(key_or_name: Optional[str] = None, station: Optional[str] = None) 
     k = (key_or_name or os.environ.get(WORLD_ENV) or DUAL_WORLD).strip()
     k = os.path.basename(k)
     if is_pipeline(k):
+        if pipeline_layout_of(k) == "tree":      # plain "pipeline" = the layout already selected
+            use_pipeline_layout(k)
         from factory_bringup.vision_lab.pipeline_world import station_profile
         return station_profile(station or (k.split(":", 1)[1] if ":" in k else "A1"))
     k = ALIASES.get(k, k)

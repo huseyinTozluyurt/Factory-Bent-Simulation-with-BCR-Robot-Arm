@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Builds pipeline_factory_lab.sdf, the vision-lab version of the pipeline world, from
-pipeline_factory.sdf (left as it is). What it changes:
+pipeline_factory.sdf (left as it is); with PIPELINE_LAYOUT=tree it builds pipeline_tree_factory_lab.sdf
+from pipeline_tree_factory.sdf (the tree-of-three world). What it changes:
 
   - each of the 12 BCR arms (one static model per arm) becomes 8 movable link models
     arm_<A>__<link> (no gravity, no collision), so the lab can pose the arm joint by joint;
@@ -12,6 +13,8 @@ pipeline_factory.sdf (left as it is). What it changes:
 Positions come from factory_bringup/vision_lab/pipeline_world.py (the lab uses the same module).
 
     cd my_factory_worlds/tools && python3 make_pipeline_lab_world.py
+    cd my_factory_worlds/tools && PIPELINE_LAYOUT=tree python3 make_pipeline_world.py --out ../worlds \\
+                               && PIPELINE_LAYOUT=tree python3 make_pipeline_lab_world.py
 """
 
 import math
@@ -29,7 +32,7 @@ from factory_bringup.vision_lab import pipeline_world as P             # noqa: E
 from factory_bringup.vision_lab.arm_model import ArmModel, euler      # noqa: E402
 
 WORLDS = os.path.join(HERE, "..", "worlds")
-SRC = os.path.join(WORLDS, "pipeline_factory.sdf")
+SRC = os.path.join(WORLDS, L.BASE_SDF)
 DUAL = os.path.join(WORLDS, "dual_circular_factory_conveyor.sdf")
 OUT = os.path.join(WORLDS, P.SDF)
 ARM = ArmModel()

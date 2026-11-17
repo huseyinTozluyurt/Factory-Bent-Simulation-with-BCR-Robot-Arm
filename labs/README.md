@@ -44,6 +44,19 @@ one it places on, and the station has its own trash and recycling bin.
 ./run_vision_lab.sh new my_line --template pipeline       # new whole-factory lab
 ```
 
+### Tree-of-three world
+
+The same labs run in the tree-of-three world (`pipeline_tree_factory_lab.sdf`): S1 feeds three arms
+(A1, A2 beside it, A3 at its end), each arm a sorting ring (C1, C2, C3), each ring three output lines
+with a dock (S2 ... S10, Dock 1 ... Dock 9). 13 bents, 12 arms, 33 boxes.
+
+```bash
+./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras   # terminal 1
+./run_vision_lab.sh run 11_all_boxes                            # terminal 2 (the lab finds the tree world)
+./run_vision_lab.sh run 12_arm_order                            # ORDERS_TREE; A1, A2, A3 share S1 (about a third each)
+./run_vision_lab.sh run 12_arm_order --world pipeline-tree --fake   # without Gazebo
+```
+
 ## What a lab file contains
 
 ```python

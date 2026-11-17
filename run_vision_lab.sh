@@ -14,6 +14,11 @@
 #
 # Worlds (W): dual (default), circular, straight, straight-circular, circular-straight, straight-straight,
 #             pipeline (pipeline_factory_lab.sdf: 12 arm stations; the lab works at --station A1 ... A12)
+#             pipeline-tree (pipeline_tree_factory_lab.sdf: the same 13 bents and 12 arms as a tree of three:
+#                            S1 feeds A1, A2, A3 -> rings C1, C2, C3 -> 3 output lines each)
+# Tree-of-three world (the lab finds the running world; --world pipeline-tree also works):
+#   ./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras   terminal 1
+#   ./run_vision_lab.sh run 11_all_boxes                            terminal 2 (or 12_arm_order, ...)
 # Pipeline world:
 #   ./run_vision_lab.sh sim --world pipeline        Gazebo with the lab version of pipeline_factory.sdf
 #   ./run_vision_lab.sh run LAB --station A2        a lab at arm A2 (found running; or add --world pipeline)
@@ -76,10 +81,15 @@ lab_run() {          # vision_lab run: a lab by name, --script FILE, or this fol
   ros2 run factory_bringup vision_lab run "${args[@]}"
 }
 
-is_pipeline() { [[ "$1" == pipeline* ]]; }
+is_pipeline() { [[ "$1" == pipeline* || "$1" == tree* ]]; }
+is_tree() { [[ "$1" == *tree* ]]; }
 
 pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the lab drives it over gz-transport)
-  local world_file="$PROJECT_DIR/my_factory_worlds/worlds/pipeline_factory_lab.sdf"
+  local world="$1"; shift
+  local base="pipeline_factory" layout=pipeline
+  if is_tree "$world"; then base="pipeline_tree_factory"; layout=tree; fi
+  export PIPELINE_LAYOUT=$layout                 # the world tools and the lab use the same layout
+  local world_file="$PROJECT_DIR/my_factory_worlds/worlds/${base}_lab.sdf"
   set +e
   source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
   source "$WS_DIR/install/setup.bash"
@@ -92,6 +102,9 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
   fi
   if [ ! -f "$world_file" ]; then
     echo "Building $world_file ..."
+    if [ ! -f "$PROJECT_DIR/my_factory_worlds/worlds/${base}.sdf" ]; then
+      (cd "$PROJECT_DIR/my_factory_worlds/tools" && python3 make_pipeline_world.py --out ../worlds)
+    fi
     (cd "$PROJECT_DIR/my_factory_worlds/tools" && python3 make_pipeline_lab_world.py)
   fi
   if ! python3 -c "from factory_bringup.vision_lab.pipeline_sim import _add_vendor_gz_python_paths as f; f(); import gz.transport13, gz.msgs10" 2>/dev/null; then
@@ -124,13 +137,13 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
     echo "To look at it later without restarting:  gz sim -g"
     exec gz sim -s -r "$world_file" "${gz_args[@]}"
   fi
-  echo "Pipeline lab world in Gazebo; start a lab in another terminal:  $0 run LAB --station A1"
+  echo "Pipeline lab world ($world) in Gazebo; start a lab in another terminal:  $0 run LAB"
   exec gz sim -r "$world_file" "${gz_args[@]}"
 }
 
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,56p' "$0"; exit 0 ;;
   sim)
     shift
     world=dual; rest=()
@@ -142,13 +155,13 @@ case "$cmd" in
       esac
       shift
     done
-    is_pipeline "$world" && pipeline_sim "${rest[@]}"
+    is_pipeline "$world" && pipeline_sim "$world" "${rest[@]}"
     export FACTORY_ORDER_FILE="${FACTORY_ORDER_FILE:-$HOME/.ros/factory_order_${world//-/_}.json}"
     exec bash "$PROJECT_DIR/run_factory.sh" --world "$world" "${rest[@]}" run_detector:=false run_controller:=false
     ;;
   run)
     shift; ros_env; lab_run "$@" ;;
-  check)
+  check)            # check [--world pipeline-tree]  (default: the pipeline world that is running)
     shift; ros_env; exec python3 -m factory_bringup.vision_lab.check_gz "$@" ;;
   offline|worlds|detectors|new|list|templates)
     shift; ros_env; exec ros2 run factory_bringup vision_lab "$cmd" "$@" ;;
@@ -171,7 +184,7 @@ case "$cmd" in
     log="${TMPDIR:-/tmp}/vision_lab_sim.log"
     echo "Starting the $world simulation in the background (log: $log) ..."
     if is_pipeline "$world"; then
-      bash "$0" sim --world pipeline > "$log" 2>&1 &
+      bash "$0" sim --world "$world" > "$log" 2>&1 &
     else
       bash "$0" sim --world "$world" --world-products order_gui:=false > "$log" 2>&1 &
     fi

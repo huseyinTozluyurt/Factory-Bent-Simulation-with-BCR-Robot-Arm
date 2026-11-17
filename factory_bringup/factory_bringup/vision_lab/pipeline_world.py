@@ -1,7 +1,8 @@
 """
 Geometry of the pipeline world for the vision lab (no ROS, no Gazebo imports).
 
-pipeline_layout.py defines the conveyors and the 12 arm stations. This module adds what the lab
+pipeline_layout.py defines the conveyors and the 12 arm stations (of the layout PIPELINE_LAYOUT selects:
+the pipeline world, or the tree-of-three world of pipeline_tree_layout.py). This module adds what the lab
 needs on top, the same way for the world generator (make_pipeline_lab_world.py) and the running
 lab (pipeline_sim.py / pipeline_lab.py):
   - the product path of every conveyor (path_xy / path_s / length),
@@ -19,7 +20,8 @@ from factory_bringup.product_catalog import BIN_SIZE
 from factory_bringup.vision_lab.worlds import Lane, WorldProfile
 
 WORLD_NAME = L.WORLD_NAME
-SDF = "pipeline_factory_lab.sdf"
+SDF = L.LAB_SDF
+WORLD_KEY = "pipeline-tree" if L.LAYOUT == "tree" else "pipeline"   # --world key of this layout
 STATIONS: List[str] = list(L.ARMS)
 R = L.RING_PATH_RADIUS                  # products ride the rings at r = 3.42
 RING_LANE = (3.10, 3.75)                # camera search lane of a ring (as in the other worlds)
@@ -207,7 +209,7 @@ def station_profile(arm: str) -> WorldProfile:
         raise ValueError(f"unknown pipeline station '{arm}'; stations: {', '.join(STATIONS)}")
     st = station(arm)
     return WorldProfile(
-        key=f"pipeline:{arm}", name=WORLD_NAME, sdf=SDF, has_bent2=True,
+        key=f"{WORLD_KEY}:{arm}", name=WORLD_NAME, sdf=SDF, has_bent2=True,
         bent1_shape="circular" if is_ring(st["pick_conv"]) else "straight",
         bent2_shape="circular" if is_ring(st["place_conv"]) else "straight",
         lanes=[lane(st["pick_conv"], st["pick"], "ring1"), lane(st["place_conv"], st["place"], "ring2")],
@@ -226,7 +228,7 @@ def describe() -> str:
     for a in STATIONS:
         st = station(a)
         b = bins(a)
-        lines.append(f"pipeline:{a:4s} {st['pick_conv']} -> {st['place_conv']:3s} rule {st['rule']:10s} "
+        lines.append(f"{WORLD_KEY}:{a:4s} {st['pick_conv']} -> {st['place_conv']:3s} rule {st['rule']:10s} "
                      f"bins recycling ({b['recycling'][0]:.1f}, {b['recycling'][1]:.1f}) "
                      f"trash ({b['trash'][0]:.1f}, {b['trash'][1]:.1f})  clearance "
                      f"{min(_clearance(*b['recycling'], a), _clearance(*b['trash'], a)):+.2f} m")

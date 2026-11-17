@@ -5,6 +5,11 @@ that match their rule, and every final straight line ends over a dock box.
 The world generator (my_factory_worlds/tools/make_pipeline_world.py) builds the world from this
 table; a later pipeline controller can read the same table.
 
+Two layouts share this module's names (WORLD_NAME, CIRCLES, STRAIGHTS, ARMS, HALL, ...):
+  PIPELINE_LAYOUT=pipeline (default)  the tables below
+  PIPELINE_LAYOUT=tree                pipeline_tree_layout.py: S1 feeds three arms, a tree of three
+The variable is read once, at import; the vision lab sets it from its world option (pipeline-tree).
+
 Flow:  S1 inbound -> A1 -> C1 sorter 1
          C1 -> A2 (recyclable)     -> S2 -> A4 -> C2 recycling sort
                 C2 -> A6 (cardboard)   -> S4 -> dock 1
@@ -16,6 +21,8 @@ Flow:  S1 inbound -> A1 -> C1 sorter 1
                        C4 -> A12 (other)   -> S9 -> dock 5
 """
 WORLD_NAME = "pipeline_factory_world"
+BASE_SDF = "pipeline_factory.sdf"          # layout world (make_pipeline_world.py)
+LAB_SDF = "pipeline_factory_lab.sdf"       # vision-lab world (make_pipeline_lab_world.py)
 BELT_TOP_Z = 1.375          # top of every belt, as in the other worlds
 RING_PATH_RADIUS = 3.42     # products ride the circular conveyors at this radius (counter-clockwise)
 ARM_BASE_Z = -0.508         # arm base height, as the BCR arm in the other worlds
@@ -61,3 +68,34 @@ ARMS = {
 }
 
 HALL = (-26.0, 47.0, -28.0, 28.0)   # x min, x max, y min, y max of the hall walls
+WALKWAYS_Y = (-11.0, 11.0)          # painted walkway lines across the hall
+LIGHTS = tuple((x, y) for x in (-14, 6, 26) for y in (-16, 0, 16))
+
+# ------------------------------------------------------------------ layout selection
+LAYOUTS = {"pipeline": "pipeline", "default": "pipeline", "tree": "tree", "tree3": "tree",
+           "pipeline-tree": "tree", "pipeline_tree": "tree"}
+
+
+def layout_key(text) -> str:
+    """'pipeline' or 'tree' for a PIPELINE_LAYOUT value or a --world key (pipeline-tree, pipeline-tree:A4, ...)."""
+    k = str(text or "").strip().lower().split(":")[0]
+    if k.endswith(".sdf"):
+        k = k[:-4]
+    if "tree" in k:
+        return "tree"
+    return LAYOUTS.get(k, "pipeline")
+
+
+def _select():
+    import os
+    key = layout_key(os.environ.get("PIPELINE_LAYOUT", ""))
+    if key == "tree":
+        from factory_bringup import pipeline_tree_layout as T
+        names = ("WORLD_NAME", "BASE_SDF", "LAB_SDF", "BELT_TOP_Z", "RING_PATH_RADIUS", "ARM_BASE_Z", "BELT_SPEED",
+                 "CIRCLES", "STRAIGHTS", "ARMS", "HALL", "WALKWAYS_Y", "LIGHTS")
+        globals().update({n: getattr(T, n) for n in names})
+        globals()["__doc__"] = T.__doc__
+    return key
+
+
+LAYOUT = _select()

@@ -84,8 +84,10 @@ class CaseResult:
 def pickers(conv: str) -> List[str]:
     """The stations that pick from a conveyor, in the order a product on it meets them."""
     arms = [a for a in P.STATIONS if P.station(a)["pick_conv"] == conv]
-    if not P.is_ring(conv) or len(arms) < 2:
+    if len(arms) < 2:
         return arms
+    if not P.is_ring(conv):                     # a straight with several arms (S1 of the tree world)
+        return sorted(arms, key=lambda a: P.path_s(conv, *P.station(a)["pick"]))
     cx, cy, _ = L.CIRCLES[conv]
     ang = lambda p: math.atan2(p[1] - cy, p[0] - cx) % (2 * math.pi)  # noqa: E731
     feed = [P.station(a)["place"] for a in P.STATIONS if P.station(a)["place_conv"] == conv]
@@ -289,10 +291,10 @@ def summary(results: List[CaseResult]) -> str:
 """
 The "all boxes" test: a fixed number of products (default 70) enters on S1 one after another, every
 belt and all 12 arms work at once, and the test PASSES when
-  - each of the 29 boxes of the factory has at least one product: the trash bin and the recycling bin
-    of every station (24) and the 5 dock boxes, and
+  - each box of the factory (29; 33 in the tree world) has at least one product: the trash bin and the recycling bin
+    of every station (24) and the dock boxes (5; 9 in the tree world), and
   - every product has ended in a box; once all boxes are filled the remaining products all go to the
-    docks (Dock 1 ... Dock 5), none is left on a belt, in a gripper or on the floor.
+    docks (Dock 1 ... Dock 5, or ... Dock 9), none is left on a belt, in a gripper or on the floor.
 
 Every station decides with AllBoxesPolicy (need-based), so the result does not depend on the product
 mix and a missed product is simply taken on the next try.
@@ -303,7 +305,8 @@ DOCK_TITLES: Dict[str, str] = {f"dock_{c}": dock.title() for c, (_s, _e, _l, doc
 
 
 def all_boxes() -> List[str]:
-    """The 29 boxes: trash and recycling bin of every station (A1 ... A12), then the 5 docks."""
+    """Every box: trash and recycling bin of every station (A1 ... A12), then the docks (pipeline world:
+    24 + 5 = 29 boxes, tree world: 24 + 9 = 33)."""
     return [P.bin_name(a, k) for a in P.STATIONS for k in ("trash", "recycling")] + DOCKS
 
 
@@ -340,13 +343,14 @@ class AllBoxesPolicy:
       2. the boxes further down the line still need products: bent2
       3. one of the station's own bins is still empty: into that bin
       4. otherwise skip (on a straight it waits and is judged again; on a ring it rides on to the
-         next arm or comes round again)
+         next arm or comes round again). The last arm of a straight that several arms share (S1 of the
+         tree world) takes it to bent2 instead, so the products behind it are not blocked.
       "Need" = empty boxes downstream minus the products already on their way there (on those belts or
       in those arms' grippers), so the line is not flooded and the branches share the products.
     Phase 2, every box has a product: no more bins, every product goes on towards the docks. Where a
-    ring has two arms, the first one takes a product only while its docks have no more products per
-    dock (counting the ones on their way) than the other arm's; the last arm takes all the others, so
-    the remaining products are spread over Dock 1 ... Dock 5 and nothing circles forever.
+    ring (or, in the tree world, S1) has several arms, an arm takes a product only while its docks have
+    no more products per dock (counting the ones on their way) than the other arms'; the last arm takes
+    all the others, so the remaining products are spread over all docks and nothing circles forever.
     """
 
     def __init__(self, sim, trash_labels=("sneaker_pair", "packet_pouch", "unknown"), by: str = "label"):
@@ -359,7 +363,7 @@ class AllBoxesPolicy:
         self._convs = {c: set(downstream_convs(c)) for c in convs}
         self._boxes = {c: downstream_boxes(c) for c in convs}
         self._docks = {c: downstream_docks(c) for c in convs}
-        self._order = {c: pickers(c) for c in L.CIRCLES}
+        self._order = {c: pickers(c) for c in convs}
         self._lock = threading.Lock()
 
     def filled(self, box: str) -> bool:
@@ -416,6 +420,10 @@ class AllBoxesPolicy:
             for kind in ("recycling", "trash"):
                 if not self.filled(own[kind]):
                     return kind
+            conv = P.station(arm)["pick_conv"]
+            order = self._order.get(conv) or []
+            if not P.is_ring(conv) and len(order) > 1 and arm == order[-1]:
+                return "bent2"                          # the end of a shared straight (tree S1): it would block the belt
             return "skip"
 
 
