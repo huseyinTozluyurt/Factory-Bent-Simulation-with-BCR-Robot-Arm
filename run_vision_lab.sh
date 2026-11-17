@@ -10,6 +10,7 @@
 #   ./run_vision_lab.sh [--world W] [vision_lab options]           both: simulation in the background, then the lab
 #   ./run_vision_lab.sh offline [options]                          no simulation: images or synthetic scenes
 #   ./run_vision_lab.sh worlds | detectors                         what is available
+#   ./run_vision_lab.sh check                                      pipeline: can the lab spawn / move / see in Gazebo?
 #
 # Worlds (W): dual (default), circular, straight, straight-circular, circular-straight, straight-straight,
 #             pipeline (pipeline_factory_lab.sdf: 12 arm stations; the lab works at --station A1 ... A12)
@@ -18,6 +19,13 @@
 #   ./run_vision_lab.sh run LAB --station A2        a lab at arm A2 (found running; or add --world pipeline)
 #   ./run_vision_lab.sh run LAB --fake --station A6 the same without Gazebo (drawn camera images)
 #   ./run_vision_lab.sh --world pipeline [LAB ...]  both: Gazebo in the background, then the lab
+#   ./run_vision_lab.sh sim --world pipeline --headless   Gazebo without its 3D window (much lighter; gz sim -g opens it)
+#   ./run_vision_lab.sh sim --world pipeline --drawn-cameras   no camera rendering in Gazebo: the lab draws the
+#                                                   station images from the simulation (lightest; Gazebo stays fast)
+#   ./run_vision_lab.sh sim --world pipeline --nvidia     render on the NVIDIA GPU of a hybrid (Intel/AMD + NVIDIA) laptop
+# Speed settings (pipeline world; use the same in both terminals):
+#   PIPELINE_CAMERA=balanced (default 960x540@4) | lite (640x360@3) | full (1280x720@5) | WxH@RATE
+#   PIPELINE_PHYSICS_STEP=0.004 (default; 0.001 = Gazebo's)   PIPELINE_LAZY_CAMERAS=1 (default; 0 = always detect)
 # "sim" is run_factory.sh without the standard detector and pick-and-place controller (the lab brings its
 # own): run_factory.sh --world W ... run_detector:=false run_controller:=false. Its order window, --no-select,
 # --world-products and --build work as there.
@@ -86,21 +94,43 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
     echo "Building $world_file ..."
     (cd "$PROJECT_DIR/my_factory_worlds/tools" && python3 make_pipeline_lab_world.py)
   fi
-  if ! python3 -c "import gz.transport13, gz.msgs10" 2>/dev/null; then
-    echo "Note: the lab needs the gz-transport Python bindings: sudo apt install python3-gz-transport13"
+  if ! python3 -c "from factory_bringup.vision_lab.pipeline_sim import _add_vendor_gz_python_paths as f; f(); import gz.transport13, gz.msgs10" 2>/dev/null; then
+    echo "Note: the lab needs the gz-transport Python bindings (sudo apt install python3-gz-transport13 python3-gz-msgs10"
+    echo "      from packages.osrfoundation.org, see COMMANDS.md). Without them use: $0 run LAB --fake"
   fi
+  # camera size / rate (PIPELINE_CAMERA), drawn cameras and physics step (PIPELINE_PHYSICS_STEP), in place
+  for a in "$@"; do [[ "$a" == --drawn-cameras ]] && export PIPELINE_CAMERAS=drawn; done
+  python3 "$PROJECT_DIR/my_factory_worlds/tools/tune_pipeline_lab_world.py" "$world_file" || true
   export GZ_SIM_RESOURCE_PATH="$share${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
   if pgrep -f "gz sim" > /dev/null; then
     echo "Gazebo is already running (another simulation?). Close it first."
     exit 1
   fi
+  local gz_args=() headless=false
+  for a in "$@"; do
+    case "$a" in
+      --headless) headless=true ;;
+      --drawn-cameras) ;;                                  # handled before tuning the world
+      --nvidia)                                            # render on the NVIDIA GPU (hybrid laptops)
+        export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia
+        [ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] && \
+          export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+        echo "Rendering on the NVIDIA GPU (PRIME offload)" ;;
+      *) gz_args+=("$a") ;;
+    esac
+  done
+  if $headless; then
+    echo "Pipeline lab world in Gazebo, headless (no 3D window). Start a lab in another terminal:  $0 run LAB"
+    echo "To look at it later without restarting:  gz sim -g"
+    exec gz sim -s -r "$world_file" "${gz_args[@]}"
+  fi
   echo "Pipeline lab world in Gazebo; start a lab in another terminal:  $0 run LAB --station A1"
-  exec gz sim -r "$world_file" "$@"
+  exec gz sim -r "$world_file" "${gz_args[@]}"
 }
 
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
   sim)
     shift
     world=dual; rest=()
@@ -118,6 +148,8 @@ case "$cmd" in
     ;;
   run)
     shift; ros_env; lab_run "$@" ;;
+  check)
+    shift; ros_env; exec python3 -m factory_bringup.vision_lab.check_gz "$@" ;;
   offline|worlds|detectors|new|list|templates)
     shift; ros_env; exec ros2 run factory_bringup vision_lab "$cmd" "$@" ;;
   *)

@@ -24,8 +24,27 @@ STATIONS: List[str] = list(L.ARMS)
 R = L.RING_PATH_RADIUS                  # products ride the rings at r = 3.42
 RING_LANE = (3.10, 3.75)                # camera search lane of a ring (as in the other worlds)
 LINE_HALF = 0.325                       # camera search half width of a straight belt
-CAM_Z, CAM_HFOV, CAM_SIZE = 7.6, 1.40, (1280, 720)
-CAM_RATE = 5
+CAM_Z, CAM_HFOV = 7.6, 1.40
+# station cameras: PIPELINE_CAMERA=WIDTHxHEIGHT@RATE, or a preset. The world (make_pipeline_lab_world.py)
+# and the lab must use the same setting; run_vision_lab.sh rebuilds the world when it changes.
+CAMERA_PRESETS = {"full": "1280x720@5", "balanced": "960x540@4", "lite": "640x360@3"}
+DEFAULT_CAMERA = "balanced"
+
+
+def _camera_setting():
+    import os
+    import re
+    text = os.environ.get("PIPELINE_CAMERA", "").strip().lower() or DEFAULT_CAMERA
+    text = CAMERA_PRESETS.get(text, text)
+    m = re.fullmatch(r"(\d+)x(\d+)(?:@(\d+(?:\.\d+)?))?", text)
+    if not m:
+        raise ValueError(f"PIPELINE_CAMERA={text!r}: use WIDTHxHEIGHT@RATE (e.g. 960x540@4) or "
+                         f"{', '.join(CAMERA_PRESETS)}")
+    rate = float(m.group(3) or 5)
+    return (int(m.group(1)), int(m.group(2))), (int(rate) if rate.is_integer() else rate)
+
+
+CAM_SIZE, CAM_RATE = _camera_setting()
 BIN_OFFSETS = (2.2, 1.95, 2.45)         # tried distances of a bin from the arm base, across the station axis
 BIN_SHIFTS = (0.0, 0.4, -0.4, 0.8, -0.8)
 

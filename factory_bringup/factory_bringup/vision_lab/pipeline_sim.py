@@ -70,10 +70,41 @@ class Arm:
 
 
 # ------------------------------------------------------------------------------------------ backends
+GZ_BINDINGS_HELP = (
+    "The pipeline lab needs the gz-transport Python bindings (gz.transport13, gz.msgs10).\n"
+    "On ROS 2 Jazzy (Gazebo Harmonic) install them from the Gazebo package repository:\n"
+    "  sudo curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg\n"
+    "  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] "
+    "http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main\" "
+    "| sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null\n"
+    "  sudo apt update && sudo apt install python3-gz-transport13 python3-gz-msgs10\n"
+    "Check:  python3 -c 'import gz.transport13, gz.msgs10'\n"
+    "Or run the lab without Gazebo: add --fake")
+
+
+def _add_vendor_gz_python_paths():
+    """ROS 2 installs Gazebo as vendor packages under /opt/ros/<distro>/opt/gz_*_vendor; where they ship
+    Python bindings, put them on sys.path (and GZ_PYTHON_PATH=dir1:dir2 for a custom location)."""
+    import glob
+    import os
+    import sys
+    dirs = [d for d in os.environ.get("GZ_PYTHON_PATH", "").split(os.pathsep) if d]
+    for pat in ("/opt/ros/*/opt/gz_*_vendor/lib/python*/site-packages", "/opt/ros/*/opt/gz_*_vendor/lib/python*/dist-packages",
+                "/opt/ros/*/opt/gz_*_vendor/lib/python"):
+        dirs += sorted(glob.glob(pat))
+    for d in dirs:
+        if os.path.isdir(os.path.join(d, "gz")) and d not in sys.path:
+            sys.path.append(d)
+
+
 class GzBackend:
     """Gazebo through gz-transport (the Python bindings the attacher already uses)."""
 
     def __init__(self, world: str = P.WORLD_NAME):
+        try:
+            import gz.transport13  # noqa: F401
+        except ImportError:
+            _add_vendor_gz_python_paths()
         try:
             from gz.transport13 import Node
             from gz.msgs10.boolean_pb2 import Boolean
@@ -83,12 +114,31 @@ class GzBackend:
             from gz.msgs10.pose_pb2 import Pose
             from gz.msgs10.pose_v_pb2 import Pose_V
         except ImportError as exc:
-            raise ImportError("The pipeline lab needs the gz-transport Python bindings: "
-                              "sudo apt install python3-gz-transport13 python3-gz-msgs10") from exc
+            raise ImportError(GZ_BINDINGS_HELP) from exc
         self.m = dict(Boolean=Boolean, EntityFactory=EntityFactory, Entity=Entity, Image=Image, Pose=Pose, Pose_V=Pose_V)
         self.node = Node()
         self.world = world
         self.pose_vector_ok = True
+        self.create_cli = False                     # spawn through `gz service` (set when the bindings fail)
+        self.last_error = ""
+        # poses go to Gazebo from their own thread, newest pose per model wins: the engine never waits
+        # for Gazebo, so belts and arms move at their real speed even when a request is slow
+        self._pending: Dict[str, Tuple] = {}
+        self._pending_cv = threading.Condition()
+        self._vector_fails = 0
+        self._sender = threading.Thread(target=self._send_loop, name="gz_pose_sender", daemon=True)
+        self._sender.start()
+        self._cams: List[Tuple] = []                # (topic, callback, wanted) of every camera subscription
+        self._last_image = 0.0
+        self._bridge = None                         # ros_gz_bridge process, when the bindings get no images
+        self._ros = None                            # (rclpy node, executor thread) of that fallback
+        # PIPELINE_CAMERAS=drawn: Gazebo shows the factory, but the station camera images are drawn by the
+        # lab from the engine state (as with --fake). No camera rendering in Gazebo: far lighter on a PC
+        # without a working GPU. auto (default): Gazebo's cameras, drawn ones if no image arrives.
+        import os
+        self.camera_mode = os.environ.get("PIPELINE_CAMERAS", "auto").strip().lower()
+        self._drawn: Optional["FakeBackend"] = FakeBackend() if self.camera_mode == "drawn" else None
+        self._engine = None
 
     def running(self) -> bool:
         try:
@@ -107,6 +157,24 @@ class GzBackend:
         ok, res = self.node.request(f"/world/{self.world}/{service}", msg, type(msg), self.m[rep], timeout)
         return bool(ok and getattr(res, "data", True))
 
+    def _cli_req(self, service, msg, rep_type="gz.msgs.Boolean", timeout=10000) -> bool:
+        """The same request through the `gz service` command line (Gazebo's own gz-transport library),
+        for when the Python bindings cannot reach the service (e.g. bindings and Gazebo from different installs)."""
+        import subprocess
+        from google.protobuf import text_format
+        req_type = "gz.msgs." + type(msg).__name__
+        cmd = ["gz", "service", "-s", f"/world/{self.world}/{service}", "--reqtype", req_type, "--reptype", rep_type,
+               "--timeout", str(timeout), "--req", text_format.MessageToString(msg, as_one_line=True)]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout / 1000 + 5)
+        except Exception as exc:
+            self.last_error = f"gz service failed: {exc}"
+            return False
+        ok = "data: true" in out.stdout
+        if not ok:
+            self.last_error = f"gz service {service}: {(out.stdout + out.stderr).strip()[:300] or 'no answer'}"
+        return ok
+
     def _pose(self, msg, x, y, z, q):
         msg.position.x, msg.position.y, msg.position.z = x, y, z
         msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = q
@@ -115,35 +183,93 @@ class GzBackend:
         f = self.m["EntityFactory"]()
         f.sdf, f.name, f.allow_renaming = sdf, name, False
         self._pose(f.pose, x, y, z, q)
-        return self._req("create", f, "Boolean")
+        if self.create_cli:
+            return self._cli_req("create", f)
+        for timeout in (5000, 10000):               # a busy Gazebo (12 cameras) can take a few seconds
+            if self._req("create", f, "Boolean", timeout):
+                return True
+        self.last_error = "the Python bindings got no answer from /create"
+        if self._cli_req("create", f):              # bindings cannot reach it: use the gz CLI from now on
+            self.create_cli = True
+            return True
+        return False
 
     def remove(self, name: str) -> bool:
+        with self._pending_cv:
+            self._pending.pop(name, None)
         e = self.m["Entity"]()
         e.name, e.type = name, self.m["Entity"].MODEL
         return self._req("remove", e, "Boolean")
 
     def set_poses(self, poses: List[Tuple[str, float, float, float, Tuple]]):
+        """Queue poses for Gazebo (returns at once; the sender thread sends the newest of each model)."""
         if not poses:
             return
+        with self._pending_cv:
+            for item in poses:
+                self._pending[item[0]] = item
+            self._pending_cv.notify()
+
+    def _send_loop(self):
+        while True:
+            t0 = time.time()
+            with self._pending_cv:
+                while not self._pending:
+                    self._pending_cv.wait()
+                batch, self._pending = list(self._pending.values()), {}
+            try:
+                if not self._send(batch) and self._vector_fails < 3:
+                    with self._pending_cv:             # not delivered: keep them unless newer ones came
+                        for item in batch:
+                            self._pending.setdefault(item[0], item)
+                    time.sleep(0.05)
+            except Exception:
+                time.sleep(0.2)
+            time.sleep(max(0.0, 1.0 / 30 - (time.time() - t0)))    # at most 30 updates per second
+
+    def _send(self, poses) -> bool:
         if self.pose_vector_ok:
             v = self.m["Pose_V"]()
             for name, x, y, z, q in poses:
                 p = v.pose.add()
                 p.name = name
                 self._pose(p, x, y, z, q)
-            if self._req("set_pose_vector", v, "Boolean", 1000):
-                return
-            self.pose_vector_ok = False          # older Gazebo: one call per model
+            if self._req("set_pose_vector", v, "Boolean", 2000):
+                self._vector_fails = 0
+                return True
+            self._vector_fails += 1
+            # a slow answer is not a missing service: fall back to one call per model only if Gazebo
+            # really has no set_pose_vector (one call per model is far too slow for the whole factory)
+            if self._vector_fails >= 5 and not self._has_service("set_pose_vector"):
+                self.pose_vector_ok = False
+            return False
         for name, x, y, z, q in poses:
             p = self.m["Pose"]()
             p.name = name
             self._pose(p, x, y, z, q)
             self._req("set_pose", p, "Boolean", 500)
+        return True
 
-    def subscribe_camera(self, topic: str, callback: Callable[[np.ndarray, float], None]):
+    def _has_service(self, name: str) -> bool:
+        try:
+            return any(s == f"/world/{self.world}/{name}" for s in self.node.service_list())
+        except Exception:
+            return True
+
+    def subscribe_camera(self, topic: str, callback: Callable[[np.ndarray, float], None],
+                         wanted: Optional[Callable[[], bool]] = None):
+        """wanted() False = drop the image before converting it (a station with nothing to do)."""
         Image = self.m["Image"]
 
+        self._cams.append((topic, callback, wanted))
+        if self._drawn is not None:
+            self._drawn.subscribe_camera(topic, callback)
+            return
+
         def on_image(msg):
+            self._last_image = time.time()
+            if wanted is not None and not wanted():
+                return
             h, w = msg.height, msg.width
             data = np.frombuffer(msg.data, np.uint8)
             if data.size < h * w * 3:
@@ -153,8 +279,126 @@ class GzBackend:
         if not self.node.subscribe(Image, topic, on_image):
             raise RuntimeError(f"cannot subscribe to {topic}")
 
+    def ensure_cameras(self, timeout: float = 8.0, log=print) -> str:
+        """Wait for a camera image through the Python bindings; if none comes (seen with the OSRF
+        bindings next to ROS's own Gazebo: requests work, subscriptions stay silent), receive the
+        images through ros_gz_bridge + rclpy instead. PIPELINE_CAMERA_BRIDGE=1 forces it, =0 forbids it."""
+        import os
+        if self._drawn is not None:
+            log("station cameras: drawn by the lab from the simulation state (PIPELINE_CAMERAS=drawn)")
+            return "drawn"
+        mode = os.environ.get("PIPELINE_CAMERA_BRIDGE", "auto").strip().lower()
+        if not self._cams or mode in ("0", "off", "no"):
+            return "gz-transport"
+        if self.camera_mode == "auto":
+            try:
+                topics = self.node.topic_list()
+            except Exception:
+                topics = None
+            if topics is not None and self._cams[0][0] not in topics:
+                log("Gazebo has no station cameras (started with --drawn-cameras): "
+                    "drawing them from the simulation state")
+                self.use_drawn()
+                return "drawn"
+        if mode not in ("1", "on", "yes"):
+            end = time.time() + timeout
+            while time.time() < end and self._last_image == 0.0:
+                time.sleep(0.2)
+            if self._last_image:
+                return "gz-transport"
+            log(f"no camera image through the gz Python bindings in {timeout:.0f} s: "
+                "receiving the cameras through ros_gz_bridge instead")
+        self._start_ros_bridge(log)
+        return "ros_gz_bridge"
+
+    def _start_ros_bridge(self, log=print):
+        import subprocess
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.qos import qos_profile_sensor_data
+            from sensor_msgs.msg import Image as RosImage
+        except ImportError as exc:
+            raise RuntimeError(f"the ros_gz_bridge camera fallback needs ROS 2 (rclpy, sensor_msgs): {exc}")
+        args = [f"{t}@sensor_msgs/msg/Image[gz.msgs.Image" for t, _cb, _w in self._cams]
+        self._bridge = subprocess.Popen(["ros2", "run", "ros_gz_bridge", "parameter_bridge"] + args,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not rclpy.ok():
+            rclpy.init()
+        node = rclpy.create_node("pipeline_lab_cameras")
+
+        def make_cb(callback, wanted):
+            def cb(msg):
+                self._last_image = time.time()
+                if wanted is not None and not wanted():
+                    return
+                h, w, step = msg.height, msg.width, msg.step or msg.width * 3
+                data = np.frombuffer(bytes(msg.data), np.uint8)
+                if data.size < h * step:
+                    return
+                img = data[: h * step].reshape(h, step)[:, : w * 3].reshape(h, w, 3)
+                if msg.encoding.lower().startswith("rgb"):
+                    img = img[:, :, ::-1]
+                callback(img.copy(), time.time())
+            return cb
+        for topic, callback, wanted in self._cams:
+            node.create_subscription(RosImage, topic, make_cb(callback, wanted), qos_profile_sensor_data)
+        ex = SingleThreadedExecutor()
+        ex.add_node(node)
+        th = threading.Thread(target=ex.spin, name="pipeline_lab_ros_cameras", daemon=True)
+        th.start()
+        self._ros = (node, ex, th)
+        end = time.time() + 15.0
+        first = self._last_image
+        while time.time() < end and self._last_image == first:
+            time.sleep(0.2)
+        if self._last_image != first:
+            log("camera images arrive through ros_gz_bridge")
+        elif self.camera_mode == "auto":
+            log("no camera image through ros_gz_bridge either (is Gazebo very slow, or started with "
+                "--drawn-cameras?): drawing the station cameras from the simulation state instead")
+            self.use_drawn()
+        else:
+            log("still no camera image through ros_gz_bridge either: check  gz topic -e -t /pipeline/A1/camera -n 1")
+
+    def use_drawn(self):
+        """Switch to drawn station cameras (the Gazebo images are ignored from now on)."""
+        self._drawn = FakeBackend()
+        for topic, callback, wanted in self._cams:
+            self._drawn.subscribe_camera(topic, callback)
+        if self._engine is not None:
+            self._drawn.tick(self._engine)
+
+    @property
+    def active(self):
+        return self._drawn.active if self._drawn is not None else None
+
+    @active.setter
+    def active(self, value):
+        if self._drawn is not None:
+            self._drawn.active = value
+
+    def close(self):
+        if self._drawn is not None:
+            self._drawn.close()
+        if self._ros is not None:
+            node, ex, _th = self._ros
+            try:
+                ex.shutdown()
+                node.destroy_node()
+            except Exception:
+                pass
+        if self._bridge is not None and self._bridge.poll() is None:
+            self._bridge.terminate()
+            try:
+                self._bridge.wait(3.0)
+            except Exception:
+                self._bridge.kill()
+
     def tick(self, engine):
-        pass
+        self._engine = engine
+        if self._drawn is not None:
+            self._drawn.tick(engine)
 
 
 class FakeBackend:
@@ -183,6 +427,7 @@ class FakeBackend:
         self.cams.append((arm, callback))
 
     active: Optional[set] = None                          # stations whose camera is drawn (None = all)
+    _empty: Dict = {}
 
     def tick(self, engine):
         self.engine = engine
@@ -212,6 +457,11 @@ class FakeBackend:
                 continue                                  # only the cameras the lab looks at
             prof = P.station_profile(arm)
             near = [it for it in items if math.hypot(it[1] - prof.camera_pose["x"], it[2] - prof.camera_pose["y"]) < 7.0]
+            if not near:                                  # nothing in view: the same empty picture
+                if arm not in self._empty:
+                    self._empty[arm] = render_view(prof, [], noise=self.noise)
+                cb(self._empty[arm].copy(), now)
+                continue
             cb(render_view(prof, near, noise=self.noise), now)
 
 
@@ -223,6 +473,7 @@ class PipelineSim:
         self.lock = threading.RLock()
         self.products: Dict[str, Product] = {}
         self.running_belts: Dict[str, bool] = {c: True for c in list(L.STRAIGHTS) + list(L.CIRCLES)}
+        self.paused: Dict[str, set] = {c: set() for c in self.running_belts}   # belt -> arms busy on it
         self.model = ArmModel()
         self.arms: Dict[str, Arm] = {}
         for a in P.STATIONS:
@@ -313,6 +564,19 @@ class PipelineSim:
                 a.dirty = True
             time.sleep(1.0 / RATE)
 
+    def pause_belt(self, conv: str, arm: str):
+        """An arm is busy grasping from / placing on this belt: it stands still until every such arm is done."""
+        with self.lock:
+            self.paused.setdefault(conv, set()).add(arm)
+
+    def resume_belt(self, conv: str, arm: str):
+        with self.lock:
+            self.paused.setdefault(conv, set()).discard(arm)
+
+    def belt_moving(self, conv: str) -> bool:
+        """Running (not stopped with stop_bent) and no arm busy on it."""
+        return self.running_belts.get(conv, True) and not self.paused.get(conv)
+
     def attach(self, arm: str, product: str):
         with self.lock:
             p = self.products[product]
@@ -358,7 +622,8 @@ class PipelineSim:
         p = Product(name, ptype, conv, s)
         self._place_on_path(p)
         if not self.backend.create(name, product_sdf(name, ptype), p.x, p.y, p.z, quat(_rz(p.yaw))):
-            raise RuntimeError(f"Gazebo did not create {name} (is the pipeline lab world running?)")
+            why = getattr(self.backend, "last_error", "")
+            raise RuntimeError(f"Gazebo did not create {name}" + (f": {why}" if why else " (is the pipeline lab world running?)"))
         with self.lock:
             self.products[name] = p
         return name
@@ -417,7 +682,7 @@ class PipelineSim:
         poses = []
         with self.lock:
             for conv in self.running_belts:
-                if self.running_belts[conv]:
+                if self.running_belts[conv] and not self.paused.get(conv):
                     self._advance(conv, dt)
             for a in self.arms.values():
                 if a.carrying:
