@@ -159,6 +159,12 @@ final place (bin, dock or conveyor) from the same routing applied to its true ty
 PASS / FAIL per product. `run(..., until=fn)` stops a run when `fn()` is true (arms finish their
 current delivery). The cases are in `labs/lab_10_pipeline_tests.py`.
 
+`run_all_boxes(lab)` is the whole-pipeline test: every bent and all 12 arms run, the feeder supplies
+S1, and every station decides with `AllBoxesPolicy` (label-suited empty bin, else bent 2 while the
+boxes downstream need products, else an empty bin, else skip). It returns an `AllBoxesResult` that
+passes when all 29 boxes (`all_boxes()`: 24 station bins + 5 docks) got at least one product;
+`format_all_boxes(res)` prints the table. The lab is `labs/lab_11_all_boxes.py`.
+
 ## How it fits the existing nodes
 
 `run_vision_lab.sh sim` is `run_factory.sh ... run_detector:=false run_controller:=false`. The lab then

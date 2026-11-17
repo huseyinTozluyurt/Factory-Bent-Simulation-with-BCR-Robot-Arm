@@ -738,6 +738,9 @@ sudo apt install python3-gz-transport13                    # once: the lab drive
 ./run_vision_lab.sh run 09_pipeline_demo                    # demo: detection, one arm, the whole factory
 ./run_vision_lab.sh run 10_pipeline_tests                   # 8 pipeline test cases, PASS / FAIL per product
 PIPELINE_TESTS=branch_on_C1 ./run_vision_lab.sh run 10_pipeline_tests --fake   # one case, no Gazebo
+./run_vision_lab.sh run 11_all_boxes                        # whole pipeline test: all bents + all arms, PASS when all 29 boxes got a product
+./run_vision_lab.sh --world pipeline 11_all_boxes           # the same, Gazebo started in the background
+./run_vision_lab.sh run 11_all_boxes --fake --belt-speed 0.8   # the same without Gazebo
 ./run_vision_lab.sh offline --world pipeline --synthetic 5  # detector metrics on the 12 station cameras
 cd my_factory_worlds/tools && python3 make_pipeline_lab_world.py   # rebuild the lab world after editing pipeline_layout.py
 ```

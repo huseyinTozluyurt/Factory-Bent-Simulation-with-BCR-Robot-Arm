@@ -24,6 +24,7 @@ Each `lab_<name>.py` here is one experiment: its own detector (OpenCV or YOLO) a
 | 08_pipeline_sorting | pipeline world: all 12 arm stations sort by vision, each with its own rule and bins |
 | 09_pipeline_demo | pipeline demo in three acts: detection at A1, arm A1 to bent 2 / trash / recycling, then the whole factory; saves snapshots, a video of station A1 and report.txt |
 | 10_pipeline_tests | pipeline test cases: products through chains of arms into bins, onto further bents and into the docks; PASS / FAIL per product |
+| 11_all_boxes | whole pipeline test: all 13 bents and all 12 arms run until every one of the 29 boxes (24 station bins + 5 docks) has a product; PASS / FAIL |
 
 ## Pipeline world
 
@@ -37,6 +38,7 @@ one it places on, and the station has its own trash and recycling bin.
 ./run_vision_lab.sh run 08_pipeline_sorting               # the whole factory
 ./run_vision_lab.sh run 09_pipeline_demo                  # the demo (add --fake --belt-speed 0.8 without Gazebo)
 ./run_vision_lab.sh run 10_pipeline_tests                 # the test cases (PIPELINE_TESTS=name,... for some)
+./run_vision_lab.sh run 11_all_boxes                      # every bent, every arm, every box at least once
 ./run_vision_lab.sh run 02 --fake --station A2            # without Gazebo (drawn camera images)
 ./run_vision_lab.sh new my_line --template pipeline       # new whole-factory lab
 ```
@@ -91,3 +93,30 @@ PIPELINE_DECIDE_BY=truth ./run_vision_lab.sh run 10_pipeline_tests        # arms
 A failing product says why: the detector's label was wrong, a grasp missed, it fell, or it did not
 arrive in time. Add a case by copying a `PipelineCase(...)` in the file (framework:
 `factory_bringup/vision_lab/pipeline_testing.py`).
+
+## Whole pipeline test: every box at least once (lab 11)
+
+`lab_11_all_boxes.py` runs everything at once: all 13 bents (S1 ... S9, C1 ... C4) and all 12 arms
+(A1 ... A12). The feeder keeps putting products on S1, and the test PASSES when each of the 29 boxes
+has received at least one product: the trash bin and the recycling bin of every station (24) and the
+5 dock boxes. That also means every arm delivered and every bent carried products.
+
+Every station decides with `AllBoxesPolicy`: a product whose detector label suits one of the
+station's empty bins (recyclable -> recycling, a trash label -> trash) goes into it; otherwise it
+goes on to bent 2 while the boxes further down still need products (empty boxes minus products
+already on their way); otherwise into an empty bin of the station; otherwise the arm leaves it. So
+the result does not depend on the random product mix, and a missed or dropped product is replaced.
+
+```bash
+./run_vision_lab.sh sim --world pipeline                                   # terminal 1
+./run_vision_lab.sh run 11_all_boxes                                       # terminal 2
+./run_vision_lab.sh --world pipeline 11_all_boxes                          # both in one terminal
+./run_vision_lab.sh run 11_all_boxes --fake --belt-speed 0.8               # no Gazebo
+PIPELINE_DECIDE_BY=truth ./run_vision_lab.sh run 11_all_boxes --fake       # bins by the true type
+ALL_BOXES_TIMEOUT=2400 ./run_vision_lab.sh run 11_all_boxes                # longer time limit (default 1800 s)
+```
+
+The report (`labs/results/11_all_boxes/<time>/test_report.txt`) lists, per station, the products in
+its trash and recycling bins, how many it put on bent 2 and its missed grasps, then the 5 docks and
+how many products rode each bent. Snapshots of all 12 station cameras are saved next to it. The lab
+exits with status 1 when the test fails, so it can run in a script.
