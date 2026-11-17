@@ -579,7 +579,7 @@ class PipelineLab:
         conv = P.station(st.arm)["pick_conv"]
         v = self._speed(st, d, t)
         if v is None:
-            v = self.belt_speed if self.sim.belt_moving(conv) else 0.0
+            v = self.belt_speed if self.sim.running_belts.get(conv, True) else 0.0   # it moved until the hold
         dt = min(2.0, max(0.0, (until or time.time()) - t))
         if v * dt < 1e-3:
             return d.x, d.y
@@ -619,7 +619,7 @@ class PipelineLab:
         """True when the product stands upstream of the pick point, out of the arm's reach: let it come on."""
         st = P.station(arm)
         conv = st["pick_conv"]
-        if not self.sim.belt_moving(conv):
+        if not self.sim.running_belts.get(conv, True):     # stopped for good: it will not come closer
             return False
         try:
             for dz in (0.25, 0.01):
@@ -720,8 +720,6 @@ class PipelineLab:
             held_at = time.time()
             pick_conv = P.station(arm)["pick_conv"]
             pause = self.timing.get("pause_belt", "grasp")
-            if pause != "off":                             # the arm is busy here: its pick belt stands still
-                self.sim.pause_belt(pick_conv, arm)
             try:
                 guess = self._predict(st, det, seen, held_at)
                 target = self._remeasure(st, guess, after=held_at, label=det.label)
@@ -734,6 +732,8 @@ class PipelineLab:
                     st.number -= 1
                     self.wait_for_frame(1.0, arm)
                     continue
+                if pause != "off":                         # the arm commits: its pick belt stands still
+                    self.sim.pause_belt(pick_conv, arm)
                 with self._arm_locks[arm]:
                     self.log(f"{arm}: #{st.number} {det.label} -> {dest}")
                     self._grab(arm, target, prod)
