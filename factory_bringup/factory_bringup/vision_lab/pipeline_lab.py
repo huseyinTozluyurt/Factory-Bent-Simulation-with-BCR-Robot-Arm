@@ -14,6 +14,8 @@ At a station, bent 1 is the conveyor the arm picks from and bent 2 the conveyor 
     lab.run(stations="all")                       # every arm sorts by its rule in pipeline_layout.py,
                                                   #   using the detector's labels and sizes
     lab.run(decide, stations=["A2", "A3"])        # your own decide(ctx); ctx.station says which arm asks
+    lab.set_scheduler("rendezvous")               # belts never stop: arms meet products on the moving belt
+                                                  #   (rendezvous.py; or --arm schedule=rendezvous)
 
 Backends: "gz" drives the running Gazebo (run_vision_lab.sh sim --world pipeline), "fake" runs the
 same engine without Gazebo and draws the camera images (vision_lab run LAB --world pipeline --fake).
@@ -41,6 +43,8 @@ from factory_bringup.vision_lab.dataset import YoloDatasetRecorder
 from factory_bringup.vision_lab.detectors.base import Detector, ObjectDetection
 from factory_bringup.vision_lab.pipeline import DetectionPipeline
 from factory_bringup.vision_lab.pipeline_sim import BELT_TOP, FakeBackend, GzBackend, PipelineSim
+from factory_bringup.vision_lab.rendezvous import (ASSIGN_MODES, POOL_MODES, SCHEDULES, RendezvousScheduler,
+                                                   offset as rv_offset, track_from_detection, track_from_product, window)
 from factory_bringup.vision_lab.worlds import WorldProfile
 
 # product types a "cardboard" rule takes (A6), and the size limits of "large" (A9) / "small" (A11)
@@ -102,7 +106,16 @@ class PipelineLab:
         self.timing = {"move_duration": 0.9, "swing_duration": 2.5, "grasp_tolerance": 0.10, "roi_radius": 0.45,
                        "place_wait_sec": 30.0,
                        "pause_belt": "grasp",
-                       "locate": os.environ.get("PIPELINE_LOCATE", "assist")}
+                       "locate": os.environ.get("PIPELINE_LOCATE", "assist"),
+                       # schedule: classic     an arm holds the product it picks and its belt stands still
+                       #                       (pause_belt) while it grasps
+                       #           rendezvous  belts never stop: every arm plans where and when it meets a
+                       #                       product on the moving belt, a scheduler spreads the products
+                       #                       of shared conveyors over their arms (rendezvous.py)
+                       "schedule": os.environ.get("PIPELINE_SCHEDULE", "classic").strip().lower(),
+                       "rendezvous_assign": os.environ.get("RENDEZVOUS_ASSIGN", "balanced").strip().lower(),
+                       "rendezvous_pool": os.environ.get("RENDEZVOUS_POOL", "rules").strip().lower(),
+                       "rendezvous_window": 0.8}
         # locate: how an arm finds the product it grasps
         #   vision  only the camera (a product the detector misses is not picked; a position more than
         #           grasp_tolerance off is a missed grasp)
@@ -112,6 +125,8 @@ class PipelineLab:
         #   truth   the simulation's position and type only (tests the arms and belts without vision)   # grasp: a belt stands still while an arm grasps from or places
                                                 # on it; cycle: the pick belt stands for the whole pick+deliver; off
         self.timing.update({k: v for k, v in (arm_params or {}).items() if k in self.timing})
+        self.rendezvous: Optional[RendezvousScheduler] = None
+        self.set_scheduler(self.timing["schedule"], quiet=True)
         self.belt_speed = belt_speed
         self.sim: Optional[PipelineSim] = None
         self.stations: Dict[str, _Station] = {}
@@ -179,6 +194,7 @@ class PipelineLab:
         self.log(f"Pipeline lab ready ({'no Gazebo, drawn cameras' if self._backend_name == 'fake' else 'Gazebo'}): "
                  f"station {self.station} ({P.station(self.station)['pick_conv']} -> {P.station(self.station)['place_conv']}), "
                  f"detector {self.stations[self.station].pipe.detector.name}")
+        self._log_scheduler()
         return self
 
     def close(self):
@@ -751,11 +767,13 @@ class PipelineLab:
             px, py = st["place"]
             self._move_highest(arm, px, py, [2.0, 1.8, 1.6], self.timing["swing_duration"])
             end = time.time() + self.timing["place_wait_sec"]
-            while not self.sim.place_free(st["place_conv"], px, py) and time.time() < end:
+            rv = self.schedule == "rendezvous"           # moving belt: wait for a gap that stays free
+            while not (self._place_gap(st["place_conv"], px, py, self.timing["move_duration"]) if rv
+                       else self.sim.place_free(st["place_conv"], px, py)) and time.time() < end:
                 if self._stop.is_set():
                     raise InterruptedError("stopped")
-                time.sleep(0.2)
-            pause = self.timing.get("pause_belt", "grasp") != "off"
+                time.sleep(0.1 if rv else 0.2)
+            pause = not rv and self.timing.get("pause_belt", "grasp") != "off"
             if pause:                                      # placing: the place belt stands still
                 self.sim.pause_belt(st["place_conv"], arm)
             try:
@@ -776,6 +794,8 @@ class PipelineLab:
     def _cycle(self, arm: str, decide: Callable[[PickContext], str], deadline: Optional[float],
                skip: "_SkipList", halt: Optional[threading.Event] = None) -> Optional[PickResult]:
         """Wait for the next product at this station, decide, pick, deliver. None on timeout / stop."""
+        if self.schedule == "rendezvous":
+            return self._cycle_rendezvous(arm, decide, deadline, skip, halt)
         st = self._st(arm)
         self.activate(arm)
         failures = 0
@@ -916,6 +936,8 @@ class PipelineLab:
         if rule == "all":
             return "bent2"
         if rule == "share":                          # tree world: the S1 arms share the products evenly
+            if getattr(ctx.lab, "schedule", "classic") == "rendezvous":
+                return "bent2"                       # the rendezvous scheduler assigns the products
             return "bent2" if PipelineLab._share_turn(ctx.lab, ctx.station) else "skip"
         if d is None:
             return "skip"
@@ -1050,8 +1072,307 @@ class PipelineLab:
                     if self.assists else "every pick found by the camera"),
                  f"detector label correct (vs simulation truth): {acc}",
                  "where products are now: " + ", ".join(f"{k} {v}" for k, v in self.summary().items())]
+        if self.rendezvous is not None and self.schedule == "rendezvous":
+            lines.append(self.rendezvous.report(self.sim.stopped_time))
+        else:
+            stopped = sum(self.sim.stopped_time.values())
+            lines.append(f"schedule {self.schedule}: belts stood {stopped:.0f} s in total for arms"
+                         + (" (" + ", ".join(f"{c} {v:.0f} s" for c, v in self.sim.stopped_time.items() if v > 0.5) + ")"
+                            if stopped > 0.5 else ""))
         for r in rs[-30:]:
             mark = {True: "ok", False: "WRONG", None: "--"}[r.label_correct]
             lines.append(f"  {r.station} #{r.number}: {r.status:9s} -> {r.destination:9s} label={r.label} "
                          f"truth={r.product_type} [{mark}]")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------ rendezvous scheduling
+    @property
+    def schedule(self) -> str:
+        """classic (hold the product, pause its belt) or rendezvous (meet it on the moving belt)."""
+        return self.timing.get("schedule", "classic")
+
+    def set_scheduler(self, mode: str = "rendezvous", assign: Optional[str] = None, pool: Optional[str] = None,
+                      quiet: bool = False) -> Optional[RendezvousScheduler]:
+        """Choose how the arms pick: "classic" or "rendezvous" (see rendezvous.py). assign: "balanced"
+        (default) or "earliest"; pool: "rules" (default: the arms with rule all / share of a conveyor
+        share its products), "conveyor" (every arm of a conveyor; for policies where all of them take
+        every product) or "none"."""
+        mode = str(mode or "classic").strip().lower()
+        if mode not in SCHEDULES:
+            raise ValueError(f"schedule must be one of {', '.join(SCHEDULES)}")
+        if assign is not None:
+            self.timing["rendezvous_assign"] = str(assign).strip().lower()
+        if pool is not None:
+            self.timing["rendezvous_pool"] = str(pool).strip().lower()
+        if self.timing["rendezvous_assign"] not in ASSIGN_MODES:
+            raise ValueError(f"rendezvous_assign must be one of {', '.join(ASSIGN_MODES)}")
+        if self.timing["rendezvous_pool"] not in POOL_MODES:
+            raise ValueError(f"rendezvous_pool must be one of {', '.join(POOL_MODES)}")
+        self.timing["schedule"] = mode
+        self.rendezvous = None
+        if mode == "rendezvous":
+            self.rendezvous = RendezvousScheduler(self, self.timing["rendezvous_assign"], self.timing["rendezvous_pool"])
+            if not quiet or getattr(self, "_started", False):
+                self._log_scheduler()
+        return self.rendezvous
+
+    def _log_scheduler(self):
+        r = self.rendezvous
+        if r is None:
+            return
+        pools = ", ".join(f"{c}: {'/'.join(a)}" for c, a in r.pools.items() if len(a) >= 2) or "no shared conveyor"
+        self.log(f"schedule rendezvous: belts keep moving, arms meet the products on them; assign={r.assign_mode}, "
+                 f"shared conveyors {pools}")
+
+    def _place_gap(self, conv: str, x: float, y: float, descend: float, clearance: float = 0.5) -> bool:
+        """Moving belt: is (x, y) free when the arm has come down (`descend` s from now)? Once placed, the
+        product moves with the others, so the gap at the moment of release is the gap it keeps."""
+        now = time.time()
+        for t in (now + descend, now + descend + 0.3):
+            for p in self.sim.on_conveyor(conv):
+                px, py = track_from_product(p, now).xy_at(t)
+                if math.hypot(px - x, py - y) <= clearance:
+                    return False
+        return True
+
+    def _rv_candidates(self, st: _Station, skip: "_SkipList", sched: RendezvousScheduler):
+        """(plan, detection, product) for every product coming to this arm that it may take, earliest first."""
+        arm = st.arm
+        conv = P.station(arm)["pick_conv"]
+        now = time.time()
+        locate = self.timing.get("locate", "assist")
+        tracks = {}
+        if locate != "truth":                             # the camera's view: position, speed along the belt
+            t = st.latest[0]
+            for d in self.detections(1, station=arm, fresh=1.5):
+                x, y = self._predict(st, d, t)
+                prod = self.sim.nearest(conv, x, y, 0.4)
+                if prod is None or prod.name in skip or prod.name in tracks:
+                    continue
+                v = self._speed(st, d, t)
+                if v is None:                             # seen once only: wait for a second view (a product
+                    o = rv_offset(arm, conv, P.path_s(conv, x, y))          # entering the picture is cut off)
+                    if o < window(arm, prod.height, self.timing.get("rendezvous_window", 0.8))[0]:
+                        continue
+                    v = self.belt_speed if self.sim.belt_moving(conv) else 0.0
+                tracks[prod.name] = (track_from_detection(conv, d.x, d.y, t, v, prod.size[0] / 2), d, prod)
+                self._near_since.pop(prod.name, None)
+        if locate != "vision":                            # assist / truth: products the camera has not reported
+            for p in self.sim.on_conveyor(conv):
+                if p.name in tracks or p.name in skip:
+                    continue
+                lo, hi = window(arm, p.height, self.timing.get("rendezvous_window", 0.8))
+                o = track_from_product(p, now).offset_at(arm, now)
+                if locate == "assist":
+                    if not lo - 1.0 <= o <= hi:
+                        self._near_since.pop(p.name, None)
+                        continue
+                    if now - self._near_since.setdefault(p.name, now) < 0.5:
+                        continue
+                elif not -6.0 <= o <= hi:
+                    continue
+                sx, sy, _ = p.size
+                label = p.ptype if locate == "truth" else "unknown"
+                det = ObjectDetection(u=0.0, v=0.0, label=label, score=0.0, x=p.x, y=p.y, size_x=sx, size_y=sy, bent=1)
+                det.assisted = True
+                tracks[p.name] = (track_from_product(p, now), det, p)
+        out = []
+        for name, (tr, det, prod) in tracks.items():
+            if not sched.may_take(arm, name):
+                continue
+            plan = sched.plan(arm, name, tr, prod.height, now)
+            if plan is not None:
+                out.append((plan, det, prod))
+        out.sort(key=lambda c: c[0].t_contact)
+        return out
+
+    def _cycle_rendezvous(self, arm: str, decide: Callable[[PickContext], str], deadline: Optional[float],
+                          skip: "_SkipList", halt: Optional[threading.Event] = None) -> Optional[PickResult]:
+        """The rendezvous version of _cycle: plan, start just in time, meet the product on the moving belt."""
+        st = self._st(arm)
+        self.activate(arm)
+        sched = self.rendezvous or self.set_scheduler("rendezvous")
+        stats = sched.stats[arm]
+        decided: Dict[str, tuple] = {}
+        misses: Dict[str, int] = {}
+        failures = 0
+        while (not self._stop.is_set() and not (halt is not None and halt.is_set())
+               and (deadline is None or time.time() < deadline)):
+            sched.tick()
+            cands = self._rv_candidates(st, skip, sched)
+            if not cands:
+                self.wait_for_frame(0.5, arm)
+                continue
+            plan, det, prod = cands[0]
+            wait = plan.t_start - time.time()
+            if wait > 0.15:                               # not yet: plan again with a fresher view
+                self._stop.wait(min(0.4, wait))
+                continue
+            if prod.name not in decided:
+                st.number += 1
+                ctx = PickContext(number=st.number, detection=det, model=prod.name, product_type=type_of(prod.name),
+                                  world=st.profile, lab=self, station=arm)
+                try:
+                    dest = normalize_destination(decide(ctx))
+                except Exception as exc:
+                    self.log(f"{arm}: decide() failed for #{st.number} ({exc}); leaving it on the belt")
+                    dest = "skip"
+                decided[prod.name] = (ctx, dest)
+            ctx, dest = decided[prod.name]
+            if dest == "skip":
+                decided.pop(prod.name, None)
+                skip.add(prod.name, forever=False)
+                if prod.name not in skip.recorded:
+                    skip.recorded.add(prod.name)
+                    self._record(ctx, "skip", "skipped")
+                continue
+            if not sched.commit(arm, plan):
+                continue
+            picked = False
+            try:
+                with self._arm_locks[arm]:
+                    self.log(f"{arm}: #{ctx.number} {det.label} -> {dest}: rendezvous in {plan.t_contact - time.time():.1f} s, "
+                             f"{plan.o_contact:+.2f} m from the pick point ({plan.track.source}, "
+                             f"{plan.track.v:.2f} m/s)")
+                    self._rv_grab(arm, plan, prod, sched)
+                    picked = True
+                    t_contact = time.time()
+                    self._deliver(arm, dest, prod)
+                    sched.tail[arm].add(time.time() - t_contact)
+                stats.picks += 1
+                decided.pop(prod.name, None)
+                return self._record(ctx, dest, "delivered")
+            except _LateRendezvous as exc:
+                stats.late += 1
+                self.log(f"{arm}: #{ctx.number} rendezvous lost ({exc}); planning again")
+                self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["move_duration"])
+            except MissedGrasp as exc:
+                stats.missed += 1
+                failures += 1
+                misses[prod.name] = misses.get(prod.name, 0) + 1
+                if misses[prod.name] >= 3:
+                    skip.add(prod.name)
+                    decided.pop(prod.name, None)
+                self._record(ctx, dest, "missed")
+                self.log(f"{arm}: MISSED #{ctx.number}: {exc}")
+                self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["swing_duration"])
+                if failures >= 5:
+                    self.log(f"{arm}: 5 missed rendezvous in a row; check the detector / camera (pausing 10 s)")
+                    failures = 0
+                    self._stop.wait(10.0)
+            except InterruptedError:
+                if self.sim.arms[arm].carrying:
+                    self.sim.release_into(arm, "floor", *self.sim.tip(arm)[:2], floor=0.0)
+                return None
+            except RuntimeError as exc:
+                if self.sim.arms[arm].carrying:                    # put it back on its belt
+                    tx, ty, _ = self.sim.tip(arm)
+                    self.sim.release_on_conveyor(arm, P.station(arm)["pick_conv"], tx, ty)
+                misses[prod.name] = misses.get(prod.name, 0) + 1
+                if misses[prod.name] >= 3 or not P.is_ring(P.station(arm)["pick_conv"]):
+                    skip.add(prod.name)
+                    decided.pop(prod.name, None)
+                self.log(f"{arm}: #{ctx.number} not reachable: {exc}")
+                self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["swing_duration"])
+            finally:
+                sched.release(arm, prod.name, picked)
+        return None
+
+    def _rv_grab(self, arm: str, plan, prod, sched: RendezvousScheduler) -> None:
+        """Hover over the product as it arrives, come down with it, grasp at the planned contact point."""
+        top = BELT_TOP + prod.height
+        move = self.timing["move_duration"]
+        approach = move * 1.3
+        t0 = time.time()
+        hx, hy = plan.hover_xy()
+        cx, cy = plan.contact_xy()
+        q_h, last = None, None
+        for dz in (0.25, 0.15):
+            try:
+                q_h = self.sim.ik(arm, (hx, hy, top + dz), [self.sim.arms[arm].q])
+                break
+            except RuntimeError as exc:
+                last = exc
+        if q_h is None:
+            raise last
+        q_c = self.sim.ik(arm, (cx, cy, top + 0.01), [q_h])
+        sched.ik_time[arm].add(time.time() - t0)
+        # the IK took a while (and the other threads too): time the moves again from a fresh look at the
+        # product, so the arm reaches the planned hover and contact points WITH the product
+        tr = self._rv_refresh(arm, prod, plan.track, t0)
+        now = time.time()
+        o_h = plan.track.offset_at(arm, plan.t_hover)
+        t_hover = tr.time_at_offset(arm, o_h, now)
+        t_contact = tr.time_at_offset(arm, plan.o_contact, now)
+        standing = t_contact is not None and t_contact >= tr.stops_at() - 1e-3   # it waits there for the arm
+        if t_hover is None or t_contact is None or (t_contact < now + 0.6 * approach + 0.3 and not standing):
+            raise _LateRendezvous(f"the IK took {now - t0:.1f} s; the product is past the planned point")
+        if os.environ.get("RENDEZVOUS_DEBUG"):
+            self.log(f"{arm}: DEBUG retimed hover {t_hover - plan.t_hover:+.2f} s, contact {t_contact - plan.t_contact:+.2f} s "
+                     f"({tr.source}, {tr.v:.2f} m/s)")
+        t_hover = max(t_hover, now + 0.6 * approach)
+        t_contact = max(t_contact, t_hover + (move if standing else 0.25))
+        dur = t_hover - now                                 # arrive WITH the product, not before it
+        sched.stats[arm].stretched += max(0.0, dur - approach)
+        sched.stats[arm].lead_used.append(t_hover - t0)
+        self.sim.move_arm(arm, q_h, dur, self._stop, timed=True)
+        self.sim.move_arm(arm, q_c, max(0.25, t_contact - time.time()), self._stop, profile="linear", timed=True)
+        tip = self.sim.tip(arm)
+        off = math.hypot(prod.x - tip[0], prod.y - tip[1])
+        tol = self.timing["grasp_tolerance"]
+        if os.environ.get("RENDEZVOUS_DEBUG"):
+            self.log(f"{arm}: DEBUG at contact: late {time.time() - t_contact:+.2f} s, tip vs plan "
+                     f"{math.hypot(tip[0] - cx, tip[1] - cy) * 100:.0f} cm, product vs plan "
+                     f"{math.hypot(prod.x - cx, prod.y - cy) * 100:.0f} cm (along "
+                     f"{(rv_offset(arm, plan.track.conv, P.path_s(plan.track.conv, prod.x, prod.y)) - plan.o_contact) * 100:+.0f} cm)")
+        if off > tol and self.timing.get("locate", "assist") != "vision":
+            self.assists[arm] = self.assists.get(arm, 0) + 1
+            self.log(f"{arm}: assist #{self.assists[arm]}: the rendezvous put {prod.ptype} {off * 100:.0f} cm off; "
+                     "following it with the simulation's position")
+            t1 = time.time()
+            tr = track_from_product(prod, t1)
+            t_c = t1 + 0.5 + move * 0.6
+            q = self.sim.ik(arm, (*tr.xy_at(t_c), top + 0.01), [self.sim.arms[arm].q])
+            self.sim.move_arm(arm, q, max(0.25, t_c - time.time()), self._stop, profile="linear", timed=True)
+            tip = self.sim.tip(arm)
+            off = math.hypot(prod.x - tip[0], prod.y - tip[1])
+        if off > tol:
+            self._move(arm, (tip[0], tip[1], top + 0.3), move)
+            raise MissedGrasp(f"the product was {off * 100:.0f} cm from the gripper at the rendezvous "
+                              f"(tolerance {tol * 100:.0f} cm)")
+        sched.stats[arm].contact_err.append(off)
+        self.sim.attach(arm, prod.name)
+        self._move_highest(arm, tip[0], tip[1], [min(top + 0.5, 2.35), top + 0.35, top + 0.2, top + 0.12], move)
+
+    def _rv_refresh(self, arm: str, prod, track, since: float):
+        """The product's track from a look newer than `since`: a camera frame (vision / assist) matched near
+        where the track puts it, else (assist / truth) the simulation; else the old track."""
+        locate = self.timing.get("locate", "assist")
+        if locate == "truth":
+            return track_from_product(prod)
+        st = self._st(arm)
+        if st.latest[0] <= since:
+            self.wait_for_frame(0.6, arm)
+        t = st.latest[0]
+        if t > since:
+            px, py = track.xy_at(t)
+            best, bd = None, 0.3
+            for d in self.detections(1, station=arm, fresh=2.0):
+                dist = math.hypot(d.x - px, d.y - py)
+                if dist < bd:
+                    best, bd = d, dist
+            if best is not None:
+                new = track_from_detection(track.conv, best.x, best.y, t, track.v, track.half_len)
+                if t - track.t >= 0.8:                    # speed over the long baseline old look -> new look
+                    ds = (new.s - track.s) * (P.ring_dir(track.conv) if P.is_ring(track.conv) else 1)
+                    if P.is_ring(track.conv):
+                        ds %= P.length(track.conv)
+                    v = ds / (t - track.t)
+                    if 0.0 <= v <= 2.0 * max(self.belt_speed, 0.05):
+                        new.v = v
+                return new
+        return track_from_product(prod) if locate == "assist" else track
+
+
+class _LateRendezvous(RuntimeError):
+    pass

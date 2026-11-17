@@ -45,6 +45,7 @@ class Product:
     s: float = 0.0
     state: str = "belt"            # belt, carried, bin, dock
     held: bool = False             # stopped on the belt for a pick
+    v: float = 0.0                 # its speed along the belt now (m/s; 0 when held, queued or the belt stands)
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
@@ -474,6 +475,7 @@ class PipelineSim:
         self.products: Dict[str, Product] = {}
         self.running_belts: Dict[str, bool] = {c: True for c in list(L.STRAIGHTS) + list(L.CIRCLES)}
         self.paused: Dict[str, set] = {c: set() for c in self.running_belts}   # belt -> arms busy on it
+        self.stopped_time: Dict[str, float] = {c: 0.0 for c in self.running_belts}  # s a running belt stood for arms
         self.model = ArmModel()
         self.arms: Dict[str, Arm] = {}
         for a in P.STATIONS:
@@ -505,7 +507,7 @@ class PipelineSim:
         while not self._stop.is_set():
             t0 = time.time()
             try:
-                self.step(min(0.2, t0 - t_prev))
+                self.step(min(0.5, t0 - t_prev))       # a late step still moves the belts in real time
                 self.backend.tick(self)
             except Exception as exc:                 # keep the engine alive
                 self.log(f"engine step failed: {exc}")
@@ -546,23 +548,35 @@ class PipelineSim:
         B = self.base_T(arm)
         return [tuple((B @ frames[n])[:3, 3]) for n in self.model.links] + [tuple(self.tip(arm))]
 
-    def move_arm(self, arm: str, q_goal: Dict[str, float], duration: float, stop: Optional[threading.Event] = None):
-        """Interpolate the arm's joints to q_goal over `duration` s (joint 1 the short way round)."""
+    def move_arm(self, arm: str, q_goal: Dict[str, float], duration: float, stop: Optional[threading.Event] = None,
+                 profile: str = "smooth", timed: bool = False):
+        """Interpolate the arm's joints to q_goal over `duration` s (joint 1 the short way round).
+        profile "smooth": start and stop gently; "linear": constant joint speed (following a moving product).
+        timed: follow the wall clock, so the move ends exactly `duration` s after it started (a rendezvous
+        with a moving product), however long each step takes."""
         a = self.arms[arm]
         q0 = dict(a.q)
         goal = dict(q_goal)
         d = goal["joint1"] - q0["joint1"]
         goal["joint1"] = q0["joint1"] + math.atan2(math.sin(d), math.cos(d))
         steps = max(1, int(duration * RATE))
-        for i in range(1, steps + 1):
+        t_start = time.time()
+        i = 0
+        while True:
             if stop is not None and stop.is_set():
                 raise InterruptedError("stopped")
-            f = i / steps
-            f = f * f * (3 - 2 * f)                                  # smooth start and stop
+            if timed:
+                f = min(1.0, (time.time() - t_start) / max(duration, 1e-3))
+            else:
+                i += 1
+                f = i / steps
+            g = f * f * (3 - 2 * f) if profile == "smooth" else f    # smooth start and stop
             with self.lock:
-                a.q = {j: q0[j] + (goal[j] - q0[j]) * f for j in JOINTS}
+                a.q = {j: q0[j] + (goal[j] - q0[j]) * g for j in JOINTS}
                 a.dirty = True
-            time.sleep(1.0 / RATE)
+            if f >= 1.0:
+                break
+            time.sleep(1.0 / RATE if not timed else min(1.0 / RATE, max(0.0, t_start + duration - time.time())))
 
     def pause_belt(self, conv: str, arm: str):
         """An arm is busy grasping from / placing on this belt: it stands still until every such arm is done."""
@@ -684,6 +698,11 @@ class PipelineSim:
             for conv in self.running_belts:
                 if self.running_belts[conv] and not self.paused.get(conv):
                     self._advance(conv, dt)
+                else:
+                    if self.running_belts[conv]:                     # running, but standing for an arm
+                        self.stopped_time[conv] = self.stopped_time.get(conv, 0.0) + dt
+                    for p in self.on_conveyor(conv):
+                        p.v = 0.0
             for a in self.arms.values():
                 if a.carrying:
                     p = self.products[a.carrying]
@@ -714,7 +733,9 @@ class PipelineSim:
         ps.sort(key=lambda p: -sign * p.s)
         for i, p in enumerate(ps):
             if p.held:
+                p.v = 0.0
                 continue
+            s_before = p.s
             ds = self.speed * dt
             limit = None
             if not ring:
@@ -733,6 +754,7 @@ class PipelineSim:
                     self._to_dock(p, conv, dock)
                     continue
             p.s = new_s % n if ring else new_s
+            p.v = abs(new_s - s_before) / dt if dt > 0 else 0.0
             self._place_on_path(p)
 
     def _to_dock(self, p: Product, conv: str, dock):

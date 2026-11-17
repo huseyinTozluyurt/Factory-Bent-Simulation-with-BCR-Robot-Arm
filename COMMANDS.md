@@ -818,3 +818,19 @@ cd my_factory_worlds/tools && PIPELINE_LAYOUT=tree python3 make_pipeline_world.p
   && PIPELINE_LAYOUT=tree python3 make_pipeline_lab_world.py
 ```
 
+## Rendezvous pick-and-place scheduling: belts never stop
+
+Every arm predicts where a product on its moving pick belt will be, plans the moment it can meet it
+inside its reach window (the rendezvous), arrives over it together with the product and grasps it while
+the belt keeps moving. On conveyors that several arms share, a scheduler spreads the products over the
+arms by their rendezvous windows and when each arm is free (`factory_bringup/vision_lab/rendezvous.py`).
+
+```bash
+cd ~/ros2_ws/src/factory_bent_project
+./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras       # terminal 1 (or --world pipeline --drawn-cameras)
+./run_vision_lab.sh run 13_rendezvous                               # terminal 2: 30 products, rendezvous schedule
+RENDEZVOUS_MODE=classic ./run_vision_lab.sh run 13_rendezvous       # the same run with the classic schedule (belt stops)
+RENDEZVOUS_ASSIGN=earliest ./run_vision_lab.sh run 13_rendezvous    # assign each product to the arm that meets it first
+./run_vision_lab.sh run 12_arm_order --arm schedule=rendezvous      # any pipeline lab with the rendezvous schedule
+./run_vision_lab.sh run 13_rendezvous --fake --world pipeline-tree  # without Gazebo
+```

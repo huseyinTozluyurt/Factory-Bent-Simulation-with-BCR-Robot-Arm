@@ -160,6 +160,32 @@ makes `pipeline_layout.py`, `pipeline_world.py`, the lab and the world tools use
 `share`: the arms picking from one conveyor share its products (an arm takes a product while it has
 sent no more than its fair share onto its bent 2, else lets it pass); the last arm on the conveyor has `all`.
 
+### Rendezvous scheduling (`--arm schedule=rendezvous`)
+
+`rendezvous.py` adds a second way for the pipeline arms to pick. `schedule=classic` (default) holds the
+product and stops its belt while the arm grasps. `schedule=rendezvous` never stops a belt:
+
+- `Track`: a product's motion along its belt (path position, speed, sideways offset) from the camera
+  (two views give the speed) or from the simulation (assist / truth); `Track.xy_at(t)` predicts it.
+- `window(arm, height)`: the stretch of the pick belt around the pick point the arm can hover over and
+  grasp at (geometric reach of the BCR arm, at most `rendezvous_window` = 0.8 m either way).
+- `plan_rendezvous(...)`: the earliest moment the product is inside the window and the arm can be
+  there (IK time + approach, and when the arm's current delivery ends). The arm starts just in time,
+  stretches its approach so it arrives with the product (`move_arm(..., timed=True)`), comes down along
+  with it (`profile="linear"`) and grasps at the planned contact point. With `locate=assist` a contact
+  more than `grasp_tolerance` off is corrected with the simulation's position (counted as an assist).
+- `RendezvousScheduler`: on a conveyor several interchangeable arms pick from (pool `rules`: the arms
+  with rule all / share; `conveyor`: every arm of the conveyor; `none`), it assigns each coming
+  product to one arm by rendezvous window and arm availability (`rendezvous_assign=balanced`: fewest
+  picks first, then earliest contact; `earliest`: earliest contact). Plans are redone 5 times a second
+  until an arm commits; a commit is exclusive. Planning reads the engine's product positions (as the
+  feeder and lazy cameras do); the grasp follows `locate`.
+- Placing on a moving belt: the arm waits for a gap at the place point that is still free when it has
+  come down (`_place_gap`), the hand-off to the next bent's arms.
+
+`lab.set_scheduler("rendezvous", assign="balanced", pool="rules")`, `lab.schedule`, and `lab.report()`
+adds the rendezvous statistics and the belt stop time (`sim.stopped_time`). Lab 13 shows it.
+
 ### Pipeline test cases
 
 `pipeline_testing.py` runs test cases on a `PipelineLab`: `PipelineCase(name, items, routing)` puts

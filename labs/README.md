@@ -26,6 +26,7 @@ Each `lab_<name>.py` here is one experiment: its own detector (OpenCV or YOLO) a
 | 10_pipeline_tests | pipeline test cases: products through chains of arms into bins, onto further bents and into the docks; PASS / FAIL per product |
 | 12_arm_order | every arm picks each product that comes near it and puts it where its own order says, in turn (e.g. trash -> recycling -> next bent); orders per arm, mix them |
 | 11_all_boxes | whole pipeline test: 70 products enter on S1, all 13 bents and all 12 arms run; PASS when every one of the 29 boxes (24 station bins + 5 docks) has a product and all remaining products reached the docks |
+| 13_rendezvous | rendezvous scheduling: belts never stop; every arm plans where and when it meets a product on the moving belt, and the products of a shared conveyor are spread over its arms; compare with `RENDEZVOUS_MODE=classic` |
 
 ## Pipeline world
 
@@ -156,6 +157,30 @@ successful pick.
 ./run_vision_lab.sh run 12_arm_order                       # with ./run_vision_lab.sh sim --world pipeline running
 ./run_vision_lab.sh run 12_arm_order --fake                # no Gazebo
 ```
+
+## Rendezvous scheduling: arms meet products on moving belts (lab 13)
+
+`lab_13_rendezvous.py`: 30 products enter on S1 and every arm works, but no belt ever stops for an arm
+(schedule `rendezvous`, `factory_bringup/vision_lab/rendezvous.py`). Each arm predicts where a product
+will be from the camera (position and speed along the belt), finds the earliest moment it can meet the
+product inside its reach window, starts just in time, arrives over the product together with it, comes
+down with it and grasps it at the planned contact point. A scheduler spreads the products of a conveyor
+that several arms share over those arms by their rendezvous windows and when each arm is free, and only
+one arm commits to a product. An arm places onto its next bent only into a gap of the moving belt.
+
+```bash
+./run_vision_lab.sh sim --world pipeline-tree --drawn-cameras   # terminal 1 (or --world pipeline)
+./run_vision_lab.sh run 13_rendezvous                            # terminal 2
+RENDEZVOUS_MODE=classic ./run_vision_lab.sh run 13_rendezvous    # the same products, classic schedule, to compare
+RENDEZVOUS_ASSIGN=earliest ./run_vision_lab.sh run 13_rendezvous # whoever meets a product first takes it
+./run_vision_lab.sh run 13_rendezvous --fake --world pipeline-tree   # without Gazebo
+```
+
+Policy: `rules` (default in the tree world: layout rules, A1/A2/A3 share S1) or `spread` (default in the
+pipeline world: every arm passes every product on, and the two arms of each ring share it). The report
+gives products per minute into the docks, picks per arm, the belt stop time (0 s with rendezvous) and
+per arm the mean contact error, lost and missed rendezvous. Every other pipeline lab can use the
+rendezvous schedule too: `--arm schedule=rendezvous` (or `PIPELINE_SCHEDULE=rendezvous`).
 
 ## How arms find products (all pipeline labs)
 
