@@ -102,8 +102,8 @@ class OrderPolicy:
     def my_turn(self, lab, arm):
         """SHARE: on S1 the arm takes 1/3 of the products that reach it (A3 at the end takes the rest),
         on a ring no more than its fair share of what the ring's arms picked (PipelineLab.share_turn)."""
-        if arm not in self.share:
-            return True
+        if arm not in self.share or getattr(lab, "schedule", "classic") == "rendezvous":
+            return True                   # rendezvous: the scheduler shares the conveyor (rendezvous.py)
         return lab.share_turn(lab, arm, self.picks)
 
     def __call__(self, ctx):
