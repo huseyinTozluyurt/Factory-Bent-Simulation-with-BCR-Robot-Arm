@@ -122,3 +122,7 @@ The report (`labs/results/11_all_boxes/<time>/test_report.txt`) lists, per stati
 its trash and recycling bins, how many it put on bent 2 and its missed grasps. Then it shows each dock,
 how many products rode each bent, and any product that did not reach a box. Snapshots of all 12
 station cameras are saved next to it. The lab exits with status 1 when the test fails.
+
+While an arm grasps a product, the belt it picks from stands still (and nothing is spawned on it);
+while it places a product on its bent 2, that belt stands still. `--arm pause_belt=cycle` keeps the
+pick belt still for the whole pick and delivery, `--arm pause_belt=off` never stops a belt.

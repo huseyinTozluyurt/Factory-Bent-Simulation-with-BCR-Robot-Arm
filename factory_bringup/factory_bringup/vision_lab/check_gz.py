@@ -56,6 +56,12 @@ def main() -> int:
         p.name = name
         gz._pose(p, x + 1.0, y, BELT_TOP + 0.2, q)
         line(gz._req("set_pose_vector", v, "Boolean", 3000), "move it with set_pose_vector (Python bindings)")
+        t, n = time.time(), 0
+        while time.time() - t < 3.0:                 # how often can the lab move things?
+            p.position.x += 0.01
+            n += gz._req("set_pose_vector", v, "Boolean", 2000)
+        rate = n / (time.time() - t)
+        line(rate >= 5, f"pose updates: {rate:.0f} per second (the belts look smooth from ~10 per second)")
 
     got = []
     try:

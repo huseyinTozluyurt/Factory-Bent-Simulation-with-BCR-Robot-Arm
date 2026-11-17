@@ -98,7 +98,9 @@ class PipelineLab:
         self.output_dir = os.path.abspath(os.path.expanduser(output_dir or "vision_lab_results"))
         self.recorder = YoloDatasetRecorder(record_dataset, **(record_options or {})) if record_dataset else None
         self.timing = {"move_duration": 0.9, "swing_duration": 2.5, "grasp_tolerance": 0.10, "roi_radius": 0.45,
-                       "place_wait_sec": 30.0}
+                       "place_wait_sec": 30.0,
+                       "pause_belt": "grasp"}   # grasp: a belt stands still while an arm grasps from or places
+                                                # on it; cycle: the pick belt stands for the whole pick+deliver; off
         self.timing.update({k: v for k, v in (arm_params or {}).items() if k in self.timing})
         self.belt_speed = belt_speed
         self.sim: Optional[PipelineSim] = None
@@ -430,7 +432,7 @@ class PipelineLab:
                 continue
             for conv in list(self._feed_targets):
                 prods = self.sim.on_conveyor(conv)
-                if len(prods) >= keep or not self.sim.running_belts.get(conv, True):
+                if len(prods) >= keep or not self.sim.belt_moving(conv):    # no spawning while an arm is busy
                     continue
                 ring = P.is_ring(conv)
                 if ring:
@@ -523,7 +525,7 @@ class PipelineLab:
         conv = P.station(st.arm)["pick_conv"]
         v = self._speed(st, d, t)
         if v is None:
-            v = self.belt_speed if self.sim.running_belts.get(conv, True) else 0.0
+            v = self.belt_speed if self.sim.belt_moving(conv) else 0.0
         dt = min(2.0, max(0.0, (until or time.time()) - t))
         if v * dt < 1e-3:
             return d.x, d.y
@@ -563,7 +565,7 @@ class PipelineLab:
         """True when the product stands upstream of the pick point, out of the arm's reach: let it come on."""
         st = P.station(arm)
         conv = st["pick_conv"]
-        if not self.sim.running_belts.get(conv, True):
+        if not self.sim.belt_moving(conv):
             return False
         try:
             for dz in (0.25, 0.01):
@@ -614,9 +616,15 @@ class PipelineLab:
                 if self._stop.is_set():
                     raise InterruptedError("stopped")
                 time.sleep(0.2)
-            self._move(arm, (px, py, BELT_TOP + prod.height + 0.03), self.timing["move_duration"])
-            self.sim.release_on_conveyor(arm, st["place_conv"], px, py)
-            self._move_highest(arm, px, py, [2.0, 1.8, 1.6], self.timing["move_duration"] * 0.7)
+            pause = self.timing.get("pause_belt", "grasp") != "off"
+            if pause:                                      # placing: the place belt stands still
+                self.sim.pause_belt(st["place_conv"], arm)
+            try:
+                self._move(arm, (px, py, BELT_TOP + prod.height + 0.03), self.timing["move_duration"])
+                self.sim.release_on_conveyor(arm, st["place_conv"], px, py)
+                self._move_highest(arm, px, py, [2.0, 1.8, 1.6], self.timing["move_duration"] * 0.7)
+            finally:
+                self.sim.resume_belt(st["place_conv"], arm)
         else:
             bx, by = prof.bins[dest]
             q_high = self._bin_ik(arm, bx, by, 2.1)
@@ -656,6 +664,10 @@ class PipelineLab:
                 continue
             self.sim.hold(prod.name, True)
             held_at = time.time()
+            pick_conv = P.station(arm)["pick_conv"]
+            pause = self.timing.get("pause_belt", "grasp")
+            if pause != "off":                             # the arm is busy here: its pick belt stands still
+                self.sim.pause_belt(pick_conv, arm)
             try:
                 guess = self._predict(st, det, seen, held_at)
                 target = self._remeasure(st, guess, after=held_at, label=det.label)
@@ -671,6 +683,8 @@ class PipelineLab:
                 with self._arm_locks[arm]:
                     self.log(f"{arm}: #{st.number} {det.label} -> {dest}")
                     self._grab(arm, target, prod)
+                    if pause == "grasp":                   # product lifted: the belt may move again
+                        self.sim.resume_belt(pick_conv, arm)
                     self._deliver(arm, dest, prod)
                 return self._record(ctx, dest, "delivered")
             except MissedGrasp as exc:
@@ -702,6 +716,8 @@ class PipelineLab:
                     skip.add(prod.name)                            # a ring brings it round again
                 self.log(f"{arm}: #{st.number} not reachable: {exc}")
                 self.sim.move_arm(arm, self.sim.wait_posture(arm), self.timing["swing_duration"])
+            finally:
+                self.sim.resume_belt(pick_conv, arm)
         return None
 
     def _record(self, ctx: PickContext, dest: str, status: str) -> PickResult:

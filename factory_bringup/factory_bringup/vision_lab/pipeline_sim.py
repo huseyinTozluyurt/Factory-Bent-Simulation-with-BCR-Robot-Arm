@@ -121,6 +121,13 @@ class GzBackend:
         self.pose_vector_ok = True
         self.create_cli = False                     # spawn through `gz service` (set when the bindings fail)
         self.last_error = ""
+        # poses go to Gazebo from their own thread, newest pose per model wins: the engine never waits
+        # for Gazebo, so belts and arms move at their real speed even when a request is slow
+        self._pending: Dict[str, Tuple] = {}
+        self._pending_cv = threading.Condition()
+        self._vector_fails = 0
+        self._sender = threading.Thread(target=self._send_loop, name="gz_pose_sender", daemon=True)
+        self._sender.start()
 
     def running(self) -> bool:
         try:
@@ -177,27 +184,64 @@ class GzBackend:
         return False
 
     def remove(self, name: str) -> bool:
+        with self._pending_cv:
+            self._pending.pop(name, None)
         e = self.m["Entity"]()
         e.name, e.type = name, self.m["Entity"].MODEL
         return self._req("remove", e, "Boolean")
 
     def set_poses(self, poses: List[Tuple[str, float, float, float, Tuple]]):
+        """Queue poses for Gazebo (returns at once; the sender thread sends the newest of each model)."""
         if not poses:
             return
+        with self._pending_cv:
+            for item in poses:
+                self._pending[item[0]] = item
+            self._pending_cv.notify()
+
+    def _send_loop(self):
+        while True:
+            with self._pending_cv:
+                while not self._pending:
+                    self._pending_cv.wait()
+                batch, self._pending = list(self._pending.values()), {}
+            try:
+                if not self._send(batch) and self._vector_fails < 3:
+                    with self._pending_cv:             # not delivered: keep them unless newer ones came
+                        for item in batch:
+                            self._pending.setdefault(item[0], item)
+                    time.sleep(0.05)
+            except Exception:
+                time.sleep(0.2)
+
+    def _send(self, poses) -> bool:
         if self.pose_vector_ok:
             v = self.m["Pose_V"]()
             for name, x, y, z, q in poses:
                 p = v.pose.add()
                 p.name = name
                 self._pose(p, x, y, z, q)
-            if self._req("set_pose_vector", v, "Boolean", 1000):
-                return
-            self.pose_vector_ok = False          # older Gazebo: one call per model
+            if self._req("set_pose_vector", v, "Boolean", 2000):
+                self._vector_fails = 0
+                return True
+            self._vector_fails += 1
+            # a slow answer is not a missing service: fall back to one call per model only if Gazebo
+            # really has no set_pose_vector (one call per model is far too slow for the whole factory)
+            if self._vector_fails >= 5 and not self._has_service("set_pose_vector"):
+                self.pose_vector_ok = False
+            return False
         for name, x, y, z, q in poses:
             p = self.m["Pose"]()
             p.name = name
             self._pose(p, x, y, z, q)
             self._req("set_pose", p, "Boolean", 500)
+        return True
+
+    def _has_service(self, name: str) -> bool:
+        try:
+            return any(s == f"/world/{self.world}/{name}" for s in self.node.service_list())
+        except Exception:
+            return True
 
     def subscribe_camera(self, topic: str, callback: Callable[[np.ndarray, float], None]):
         Image = self.m["Image"]
@@ -288,6 +332,7 @@ class PipelineSim:
         self.lock = threading.RLock()
         self.products: Dict[str, Product] = {}
         self.running_belts: Dict[str, bool] = {c: True for c in list(L.STRAIGHTS) + list(L.CIRCLES)}
+        self.paused: Dict[str, set] = {c: set() for c in self.running_belts}   # belt -> arms busy on it
         self.model = ArmModel()
         self.arms: Dict[str, Arm] = {}
         for a in P.STATIONS:
@@ -377,6 +422,19 @@ class PipelineSim:
                 a.q = {j: q0[j] + (goal[j] - q0[j]) * f for j in JOINTS}
                 a.dirty = True
             time.sleep(1.0 / RATE)
+
+    def pause_belt(self, conv: str, arm: str):
+        """An arm is busy grasping from / placing on this belt: it stands still until every such arm is done."""
+        with self.lock:
+            self.paused.setdefault(conv, set()).add(arm)
+
+    def resume_belt(self, conv: str, arm: str):
+        with self.lock:
+            self.paused.setdefault(conv, set()).discard(arm)
+
+    def belt_moving(self, conv: str) -> bool:
+        """Running (not stopped with stop_bent) and no arm busy on it."""
+        return self.running_belts.get(conv, True) and not self.paused.get(conv)
 
     def attach(self, arm: str, product: str):
         with self.lock:
@@ -483,7 +541,7 @@ class PipelineSim:
         poses = []
         with self.lock:
             for conv in self.running_belts:
-                if self.running_belts[conv]:
+                if self.running_belts[conv] and not self.paused.get(conv):
                     self._advance(conv, dt)
             for a in self.arms.values():
                 if a.carrying:

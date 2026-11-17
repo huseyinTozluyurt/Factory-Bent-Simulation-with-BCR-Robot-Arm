@@ -445,7 +445,7 @@ class S1Feeder:
         sim, s0 = self.lab.sim, 0.4
         while not self._stop.is_set() and not self.done:
             free = all(abs(p.s - s0) > self.min_gap for p in sim.on_conveyor(self.conv))
-            if not free or not sim.running_belts.get(self.conv, True):
+            if not free or not sim.belt_moving(self.conv):          # no spawning while an arm grasps there
                 self._stop.wait(0.3)
                 continue
             ptype = self.items[len(self.names)]
