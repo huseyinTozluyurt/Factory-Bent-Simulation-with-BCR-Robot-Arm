@@ -287,16 +287,19 @@ def summary(results: List[CaseResult]) -> str:
 
 # ------------------------------------------------------------------------------ every box at least once
 """
-The "all boxes" test: every belt and every one of the 12 arms works at once, and the test passes
-when each of the 29 boxes of the factory (the trash bin and the recycling bin of every station, and
-the 5 dock boxes) has received at least one product.
+The "all boxes" test: a fixed number of products (default 70) enters on S1 one after another, every
+belt and all 12 arms work at once, and the test PASSES when
+  - each of the 29 boxes of the factory has at least one product: the trash bin and the recycling bin
+    of every station (24) and the 5 dock boxes, and
+  - every product has ended in a box; once all boxes are filled the remaining products all go to the
+    docks (Dock 1 ... Dock 5), none is left on a belt, in a gripper or on the floor.
 
-The products come from the feeder on S1. Every station decides with the same need-based policy
-(see AllBoxesPolicy): a product goes where a box is still empty, so the run does not depend on the
-random mix and a dropped or missed product is simply replaced by the next one.
+Every station decides with AllBoxesPolicy (need-based), so the result does not depend on the product
+mix and a missed product is simply taken on the next try.
 """
 
 DOCKS: List[str] = [f"dock_{c}" for c, (_s, _e, _l, dock) in L.STRAIGHTS.items() if dock]
+DOCK_TITLES: Dict[str, str] = {f"dock_{c}": dock.title() for c, (_s, _e, _l, dock) in L.STRAIGHTS.items() if dock}
 
 
 def all_boxes() -> List[str]:
@@ -321,21 +324,29 @@ def downstream_boxes(conv: str) -> List[str]:
     convs = downstream_convs(conv)
     out = [P.bin_name(a, k) for a in P.STATIONS if P.station(a)["pick_conv"] in convs
            for k in ("trash", "recycling")]
-    return out + [f"dock_{c}" for c in convs if f"dock_{c}" in DOCKS]
+    return out + downstream_docks(conv)
+
+
+def downstream_docks(conv: str) -> List[str]:
+    return [f"dock_{c}" for c in downstream_convs(conv) if f"dock_{c}" in DOCKS]
 
 
 class AllBoxesPolicy:
     """decide(ctx) for every station of the all-boxes test.
 
-    At a station, in this order:
+    Phase 1, while some box is still empty, at a station in this order:
       1. the product's label suits one of the station's own empty bins (recyclable -> recycling bin,
          a TRASH label -> trash bin): into that bin          (so the bins are filled by vision)
       2. the boxes further down the line still need products: bent2
       3. one of the station's own bins is still empty: into that bin
-      4. otherwise skip (on a ring the product rides on to the other arm, or comes round again)
-    "Need" = empty boxes downstream minus the products already on their way there (on those belts or
-    in those arms' grippers), so the line is not flooded and the factory splits its products between
-    the branches by itself. A product lost on the way makes a box empty again: the next one replaces it.
+      4. otherwise skip (on a straight it waits and is judged again; on a ring it rides on to the
+         next arm or comes round again)
+      "Need" = empty boxes downstream minus the products already on their way there (on those belts or
+      in those arms' grippers), so the line is not flooded and the branches share the products.
+    Phase 2, every box has a product: no more bins, every product goes on towards the docks. Where a
+    ring has two arms, the first one takes a product only while its docks have no more products per
+    dock (counting the ones on their way) than the other arm's; the last arm takes all the others, so
+    the remaining products are spread over Dock 1 ... Dock 5 and nothing circles forever.
     """
 
     def __init__(self, sim, trash_labels=("sneaker_pair", "packet_pouch", "unknown"), by: str = "label"):
@@ -344,8 +355,11 @@ class AllBoxesPolicy:
         self.trash_labels = set(trash_labels)
         self.recyclable = set(RECYCLABLE)
         self.by = by                                    # "label" (detector) or "truth" (simulation type)
-        self._convs = {c: set(downstream_convs(c)) for c in list(L.STRAIGHTS) + list(L.CIRCLES)}
-        self._boxes = {c: downstream_boxes(c) for c in self._convs}
+        convs = list(L.STRAIGHTS) + list(L.CIRCLES)
+        self._convs = {c: set(downstream_convs(c)) for c in convs}
+        self._boxes = {c: downstream_boxes(c) for c in convs}
+        self._docks = {c: downstream_docks(c) for c in convs}
+        self._order = {c: pickers(c) for c in L.CIRCLES}
         self._lock = threading.Lock()
 
     def filled(self, box: str) -> bool:
@@ -355,21 +369,44 @@ class AllBoxesPolicy:
                 return True
             return any(p.state == "falling" and p.where == box for p in self.sim.products.values())
 
-    def need(self, conv: str) -> int:
-        """Empty boxes downstream of `conv` minus the products already heading there."""
+    def all_filled(self) -> bool:
+        return all(self.filled(b) for b in all_boxes())
+
+    def coming(self, conv: str) -> int:
+        """Products on their way into the part of the line after `conv` (on its belts or in its grippers)."""
         convs = self._convs[conv]
         with self.sim.lock:
-            empty = sum(1 for b in self._boxes[conv] if not self.filled(b))
-            coming = sum(1 for p in self.sim.products.values() if p.state == "belt" and p.conv in convs)
-            coming += sum(1 for a in self.sim.arms.values()
-                          if a.carrying and P.station(a.name)["pick_conv"] in convs)
-        return empty - coming
+            n = sum(1 for p in self.sim.products.values() if p.state == "belt" and p.conv in convs)
+            n += sum(1 for a in self.sim.arms.values() if a.carrying and P.station(a.name)["pick_conv"] in convs)
+        return n
+
+    def need(self, conv: str) -> int:
+        """Empty boxes downstream of `conv` minus the products already heading there."""
+        return sum(1 for b in self._boxes[conv] if not self.filled(b)) - self.coming(conv)
+
+    def dock_load(self, conv: str) -> float:
+        """Products per dock after `conv`: already in its docks plus on their way."""
+        docks = self._docks[conv]
+        with self.sim.lock:
+            n = sum(self.sim.counts.get(d, 0) for d in docks)
+        return (n + self.coming(conv)) / max(1, len(docks))
+
+    def _phase2(self, arm: str) -> str:
+        st = P.station(arm)
+        order = self._order.get(st["pick_conv"])
+        if not order or len(order) < 2 or arm == order[-1]:
+            return "bent2"                              # straight, or the last arm of a ring: take it
+        mine = self.dock_load(st["place_conv"])
+        others = [self.dock_load(P.station(a)["place_conv"]) for a in order if a != arm]
+        return "bent2" if mine <= min(others) else "skip"
 
     def __call__(self, ctx: PickContext) -> str:
         arm = ctx.station
         label = ctx.product_type if self.by == "truth" else ctx.label
         own = {k: P.bin_name(arm, k) for k in ("trash", "recycling")}
         with self._lock:
+            if self.all_filled():
+                return self._phase2(arm)
             if label in self.trash_labels and not self.filled(own["trash"]):
                 return "trash"
             if label in self.recyclable and not self.filled(own["recycling"]):
@@ -382,14 +419,73 @@ class AllBoxesPolicy:
             return "skip"
 
 
+class S1Feeder:
+    """Puts `items` on S1 one after another, the next one as soon as the start of the belt is free
+    (min_gap m). A spawn Gazebo refuses is logged and tried again; it never stops the test."""
+
+    def __init__(self, lab, items: List[str], conv: str = "S1", min_gap: float = 1.2):
+        self.lab, self.items, self.conv, self.min_gap = lab, list(items), conv, min_gap
+        self.names: List[str] = []
+        self.failures = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="all_boxes_feeder", daemon=True)
+
+    @property
+    def done(self) -> bool:
+        return len(self.names) >= len(self.items)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        sim, s0 = self.lab.sim, 0.4
+        while not self._stop.is_set() and not self.done:
+            free = all(abs(p.s - s0) > self.min_gap for p in sim.on_conveyor(self.conv))
+            if not free or not sim.running_belts.get(self.conv, True):
+                self._stop.wait(0.3)
+                continue
+            ptype = self.items[len(self.names)]
+            try:
+                self.names += sim.spawn_row([ptype], self.conv, 1.0, s0)
+                self.failures = 0
+                if len(self.names) % 10 == 0 or self.done:
+                    self.lab.log(f"feeder: {len(self.names)}/{len(self.items)} products on {self.conv}")
+            except Exception as exc:
+                self.failures += 1
+                self.lab.log(f"feeder: spawn {len(self.names) + 1} ({ptype}) failed: {exc}")
+                if self.failures == 3:
+                    self.lab.log("feeder: Gazebo keeps refusing spawns; check with  ./run_vision_lab.sh check")
+                self._stop.wait(min(10.0, 2.0 * self.failures))
+
+
+def product_mix(n: int, items: Optional[List[str]] = None, seed: Optional[int] = 7) -> List[str]:
+    """n product types: `items` repeated in a shuffled order (seeded: the same run every time)."""
+    import random
+    pool = list(items or PRODUCT_TYPES)
+    rng = random.Random(seed)
+    out: List[str] = []
+    while len(out) < n:
+        rng.shuffle(pool)
+        out += pool
+    return out[:n]
+
+
 @dataclass
 class AllBoxesResult:
     boxes: Dict[str, int]                  # box -> products in it at the end
     deliveries: Dict[str, Dict[str, int]]  # station -> destination -> delivered products
     missed: Dict[str, int]                 # station -> missed grasps
     conveyors: Dict[str, int]              # conveyor -> products that rode it
+    spawned: int
+    wanted: int
+    left: Dict[str, int]                   # products not in a box at the end: where they are -> how many
     seconds: float
     timeout: float
+    covered_after: Optional[float] = None  # seconds until every box had a product
 
     @property
     def empty(self) -> List[str]:
@@ -404,17 +500,28 @@ class AllBoxesResult:
         return [c for c, n in self.conveyors.items() if n == 0]
 
     @property
+    def in_docks(self) -> int:
+        return sum(self.boxes[d] for d in DOCKS)
+
+    @property
     def passed(self) -> bool:
-        return not self.empty and not self.idle_arms and not self.idle_conveyors
+        return (not self.empty and not self.idle_arms and not self.idle_conveyors
+                and self.spawned == self.wanted and not self.left)
 
 
-def run_all_boxes(lab, items: Optional[List[str]] = None, timeout: float = 1800.0, decide_by: str = "label",
-                  belt_speed: Optional[float] = None,
+def run_all_boxes(lab, count: int = 70, items: Optional[List[str]] = None, timeout: float = 3600.0,
+                  decide_by: str = "label", belt_speed: Optional[float] = None, seed: Optional[int] = 7,
                   trash_labels=("sneaker_pair", "packet_pouch", "unknown")) -> AllBoxesResult:
-    """Run all 13 belts and all 12 arms until every box has at least one product (or timeout).
-    items: product types the feeder puts on S1 (default: every type in the catalog)."""
+    """`count` products enter on S1 one after another (types: `items` shuffled, default every catalog
+    type); all 13 belts and all 12 arms work until every box has a product and every product has
+    arrived in a box (the rest in the docks), or until timeout."""
     sim = lab.sim
+    mix = product_mix(count, items, seed)
+    bad = sorted({i for i in mix if i not in PRODUCT_TYPES})
+    if bad:
+        raise ValueError(f"unknown product types {bad}")
     lab._stop.clear()
+    lab.feed = False                                # this test feeds S1 itself, a fixed number of products
     sim.clear()
     with sim.lock:
         sim.counts.clear()
@@ -422,44 +529,53 @@ def run_all_boxes(lab, items: Optional[List[str]] = None, timeout: float = 1800.
             a.carrying = None
     for conv in list(sim.running_belts):
         sim.running_belts[conv] = True              # every bent runs
-    if items:
-        bad = [i for i in items if i not in PRODUCT_TYPES]
-        if bad:
-            raise ValueError(f"unknown product types {bad}")
-        lab.feed_items = list(items)
-    lab.feed = True                                 # the feeder keeps S1 supplied
     for arm in P.STATIONS:
         lab.home(arm, duration=1.0)
 
     policy = AllBoxesPolicy(sim, trash_labels, decide_by)
     boxes = all_boxes()
-    start = len(lab.results)
+    feeder = S1Feeder(lab, mix)
     t0 = time.time()
-    last = [None]
+    state = {"empty": None, "covered": None, "boxed": -1}
 
     def until() -> bool:
         empty = [b for b in boxes if not policy.filled(b)]
-        if len(empty) != last[0]:
-            last[0] = len(empty)
+        if len(empty) != state["empty"]:
+            state["empty"] = len(empty)
             lab.log(f"all boxes: {len(boxes) - len(empty)}/{len(boxes)} filled after {time.time() - t0:.0f} s"
                     + (f"; still empty: {', '.join(empty)}" if empty and len(empty) <= 8 else ""))
-        return not empty
+            if not empty and state["covered"] is None:
+                state["covered"] = time.time() - t0
+                lab.log("all boxes have a product: the remaining products go to the docks")
+        with sim.lock:
+            names = list(feeder.names)
+            boxed = sum(1 for n in names if n in sim.products and sim.products[n].state == "bin"
+                        and sim.products[n].where != "floor")
+            lost = sum(1 for n in names if n in sim.products and sim.products[n].where == "floor")
+            busy = any(a.carrying for a in sim.arms.values())
+        if boxed != state["boxed"] and boxed % 10 == 0:
+            state["boxed"] = boxed
+            lab.log(f"all boxes: {boxed}/{len(mix)} products in boxes ({sum(sim.counts.get(d, 0) for d in DOCKS)} in docks)")
+        return not empty and feeder.done and not busy and boxed + lost >= len(mix)
 
     speed = lab.belt_speed
     if belt_speed:
         lab.belt_speed = sim.speed = belt_speed
+    feeder.start()
     try:
         lab.run(policy, stations="all", timeout=timeout, until=until)
     finally:
+        feeder.stop()
         lab.belt_speed = sim.speed = speed
-        lab.feed = False
     time.sleep(1.0)                                 # let the last drop land
 
-    results = lab.results[start:]
     deliveries: Dict[str, Dict[str, int]] = {a: {} for a in P.STATIONS}
     missed: Dict[str, int] = {}
     rode: Dict[str, set] = {c: set() for c in list(L.STRAIGHTS) + list(L.CIRCLES)}
-    for r in results:
+    names = set(feeder.names)
+    for r in lab.results:
+        if r.model not in names:
+            continue
         if r.status == "delivered":
             d = deliveries[r.station]
             d[r.destination] = d.get(r.destination, 0) + 1
@@ -469,19 +585,32 @@ def run_all_boxes(lab, items: Optional[List[str]] = None, timeout: float = 1800.
                 rode[st["place_conv"]].add(r.model)
         elif r.status == "missed":
             missed[r.station] = missed.get(r.station, 0) + 1
+    left: Dict[str, int] = {}
     with sim.lock:
         counts = {b: sim.counts.get(b, 0) for b in boxes}
-        for p in sim.products.values():             # still riding at the end
-            if p.state == "belt":
-                rode[p.conv].add(p.name)
-    return AllBoxesResult(counts, deliveries, missed, {c: len(s) for c, s in rode.items()},
-                          time.time() - t0, timeout)
+        for n in names:
+            p = sim.products.get(n)
+            if p is None:
+                where = "removed"
+            elif p.state == "bin" and p.where in counts:
+                continue
+            elif p.state == "belt":
+                rode[p.conv].add(n)
+                where = f"on {p.conv}"
+            else:
+                where = p.where or p.state
+            left[where] = left.get(where, 0) + 1
+    return AllBoxesResult(counts, deliveries, missed, {c: len(s) for c, s in rode.items()}, len(feeder.names),
+                          len(mix), left, time.time() - t0, timeout, state["covered"])
 
 
 def format_all_boxes(res: AllBoxesResult) -> str:
     n_full = len(res.boxes) - len(res.empty)
-    lines = [f"[{'PASS' if res.passed else 'FAIL'}] all_boxes  ({res.seconds:.0f} s)  "
-             f"{n_full}/{len(res.boxes)} boxes got a product, "
+    covered = f", all boxes filled after {res.covered_after:.0f} s" if res.covered_after is not None else ""
+    lines = [f"[{'PASS' if res.passed else 'FAIL'}] all_boxes  ({res.seconds:.0f} s{covered})",
+             f"   products: {res.spawned}/{res.wanted} fed on S1, {sum(res.boxes.values())} in boxes "
+             f"({res.in_docks} in the docks), {sum(res.left.values())} elsewhere",
+             f"   {n_full}/{len(res.boxes)} boxes got a product, "
              f"{len(P.STATIONS) - len(res.idle_arms)}/{len(P.STATIONS)} arms delivered, "
              f"{len(res.conveyors) - len(res.idle_conveyors)}/{len(res.conveyors)} bents carried products",
              "", "   station  trash bin  recycling bin  bent2  missed   picks from -> places on"]
@@ -491,11 +620,19 @@ def format_all_boxes(res: AllBoxesResult) -> str:
         t, r = res.boxes[P.bin_name(a, "trash")], res.boxes[P.bin_name(a, "recycling")]
         lines.append(f"   {'ok  ' if t and r else 'FAIL'} {a:4s} {t:6d}     {r:9d}      {d.get('bent2', 0):5d}  "
                      f"{res.missed.get(a, 0):6d}   {st['pick_conv']} -> {st['place_conv']}")
-    lines += ["", "   docks: " + ", ".join(f"{b} {res.boxes[b]}{'' if res.boxes[b] else ' FAIL'}" for b in DOCKS),
-              "   bents: " + ", ".join(f"{c} {n}{'' if n else ' FAIL'}" for c, n in res.conveyors.items())]
+    lines.append("")
+    for b in DOCKS:
+        lines.append(f"   {'ok  ' if res.boxes[b] else 'FAIL'} {DOCK_TITLES[b]:20s} ({b}) {res.boxes[b]:4d} products")
+    lines += ["", "   bents (products that rode them): "
+              + ", ".join(f"{c} {n}{'' if n else ' FAIL'}" for c, n in res.conveyors.items())]
     if res.empty:
-        lines.append(f"   empty boxes: {', '.join(res.empty)}"
-                     + (f" (timeout {res.timeout:.0f} s reached)" if res.seconds >= res.timeout else ""))
+        lines.append(f"   FAIL empty boxes: {', '.join(res.empty)}")
+    if res.left:
+        lines.append("   FAIL products not in a box: " + ", ".join(f"{k} {v}" for k, v in sorted(res.left.items())))
+    if res.spawned < res.wanted:
+        lines.append(f"   FAIL only {res.spawned} of {res.wanted} products could be spawned")
     if res.idle_arms:
-        lines.append(f"   arms that delivered nothing: {', '.join(res.idle_arms)}")
+        lines.append(f"   FAIL arms that delivered nothing: {', '.join(res.idle_arms)}")
+    if not res.passed and res.seconds >= res.timeout:
+        lines.append(f"   (time limit {res.timeout:.0f} s reached)")
     return "\n".join(lines)

@@ -119,6 +119,8 @@ class GzBackend:
         self.node = Node()
         self.world = world
         self.pose_vector_ok = True
+        self.create_cli = False                     # spawn through `gz service` (set when the bindings fail)
+        self.last_error = ""
 
     def running(self) -> bool:
         try:
@@ -137,6 +139,24 @@ class GzBackend:
         ok, res = self.node.request(f"/world/{self.world}/{service}", msg, type(msg), self.m[rep], timeout)
         return bool(ok and getattr(res, "data", True))
 
+    def _cli_req(self, service, msg, rep_type="gz.msgs.Boolean", timeout=10000) -> bool:
+        """The same request through the `gz service` command line (Gazebo's own gz-transport library),
+        for when the Python bindings cannot reach the service (e.g. bindings and Gazebo from different installs)."""
+        import subprocess
+        from google.protobuf import text_format
+        req_type = "gz.msgs." + type(msg).__name__
+        cmd = ["gz", "service", "-s", f"/world/{self.world}/{service}", "--reqtype", req_type, "--reptype", rep_type,
+               "--timeout", str(timeout), "--req", text_format.MessageToString(msg, as_one_line=True)]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout / 1000 + 5)
+        except Exception as exc:
+            self.last_error = f"gz service failed: {exc}"
+            return False
+        ok = "data: true" in out.stdout
+        if not ok:
+            self.last_error = f"gz service {service}: {(out.stdout + out.stderr).strip()[:300] or 'no answer'}"
+        return ok
+
     def _pose(self, msg, x, y, z, q):
         msg.position.x, msg.position.y, msg.position.z = x, y, z
         msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = q
@@ -145,7 +165,16 @@ class GzBackend:
         f = self.m["EntityFactory"]()
         f.sdf, f.name, f.allow_renaming = sdf, name, False
         self._pose(f.pose, x, y, z, q)
-        return self._req("create", f, "Boolean")
+        if self.create_cli:
+            return self._cli_req("create", f)
+        for timeout in (5000, 10000):               # a busy Gazebo (12 cameras) can take a few seconds
+            if self._req("create", f, "Boolean", timeout):
+                return True
+        self.last_error = "the Python bindings got no answer from /create"
+        if self._cli_req("create", f):              # bindings cannot reach it: use the gz CLI from now on
+            self.create_cli = True
+            return True
+        return False
 
     def remove(self, name: str) -> bool:
         e = self.m["Entity"]()
@@ -394,7 +423,8 @@ class PipelineSim:
         p = Product(name, ptype, conv, s)
         self._place_on_path(p)
         if not self.backend.create(name, product_sdf(name, ptype), p.x, p.y, p.z, quat(_rz(p.yaw))):
-            raise RuntimeError(f"Gazebo did not create {name} (is the pipeline lab world running?)")
+            why = getattr(self.backend, "last_error", "")
+            raise RuntimeError(f"Gazebo did not create {name}" + (f": {why}" if why else " (is the pipeline lab world running?)"))
         with self.lock:
             self.products[name] = p
         return name

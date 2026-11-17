@@ -10,6 +10,7 @@
 #   ./run_vision_lab.sh [--world W] [vision_lab options]           both: simulation in the background, then the lab
 #   ./run_vision_lab.sh offline [options]                          no simulation: images or synthetic scenes
 #   ./run_vision_lab.sh worlds | detectors                         what is available
+#   ./run_vision_lab.sh check                                      pipeline: can the lab spawn / move / see in Gazebo?
 #
 # Worlds (W): dual (default), circular, straight, straight-circular, circular-straight, straight-straight,
 #             pipeline (pipeline_factory_lab.sdf: 12 arm stations; the lab works at --station A1 ... A12)
@@ -101,7 +102,7 @@ pipeline_sim() {     # Gazebo with pipeline_factory_lab.sdf (no ROS nodes: the l
 
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
   sim)
     shift
     world=dual; rest=()
@@ -119,6 +120,8 @@ case "$cmd" in
     ;;
   run)
     shift; ros_env; lab_run "$@" ;;
+  check)
+    shift; ros_env; exec python3 -m factory_bringup.vision_lab.check_gz "$@" ;;
   offline|worlds|detectors|new|list|templates)
     shift; ros_env; exec ros2 run factory_bringup vision_lab "$cmd" "$@" ;;
   *)

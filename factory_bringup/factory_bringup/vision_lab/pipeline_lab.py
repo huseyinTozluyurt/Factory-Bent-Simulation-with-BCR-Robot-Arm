@@ -442,7 +442,11 @@ class PipelineLab:
                     s0 = 0.4
                     near = [abs(p.s - s0) for p in prods]
                 if all(d > min_gap for d in near):
-                    self.sim.spawn_row([self._rng.choice(self.feed_items)], conv, 1.0, s0)
+                    try:
+                        self.sim.spawn_row([self._rng.choice(self.feed_items)], conv, 1.0, s0)
+                    except Exception as exc:             # keep feeding: log, wait, try again
+                        self.log(f"feeder: {exc}")
+                        time.sleep(3.0)
 
     # ------------------------------------------------------------------ arm
     def _move(self, arm: str, xyz, duration: float, seeds=None):

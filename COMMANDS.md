@@ -742,7 +742,8 @@ python3 -c 'import gz.transport13, gz.msgs10' && echo bindings ok
 ./run_vision_lab.sh run 09_pipeline_demo                    # demo: detection, one arm, the whole factory
 ./run_vision_lab.sh run 10_pipeline_tests                   # 8 pipeline test cases, PASS / FAIL per product
 PIPELINE_TESTS=branch_on_C1 ./run_vision_lab.sh run 10_pipeline_tests --fake   # one case, no Gazebo
-./run_vision_lab.sh run 11_all_boxes                        # whole pipeline test: all bents + all arms, PASS when all 29 boxes got a product
+./run_vision_lab.sh check                                   # can the lab spawn, move and see in Gazebo? (sim running)
+./run_vision_lab.sh run 11_all_boxes                        # whole pipeline test: 70 products on S1, all bents + arms; PASS when all 29 boxes got one and the rest reached the docks
 ./run_vision_lab.sh --world pipeline 11_all_boxes           # the same, Gazebo started in the background
 ./run_vision_lab.sh run 11_all_boxes --fake --belt-speed 0.8   # the same without Gazebo
 ./run_vision_lab.sh offline --world pipeline --synthetic 5  # detector metrics on the 12 station cameras
