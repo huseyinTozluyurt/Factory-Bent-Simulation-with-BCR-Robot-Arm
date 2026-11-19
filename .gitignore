@@ -8,3 +8,8 @@ node_modules/
 website/dist/
 *.tgz
 debug_frames/
+
+# local backups (history lives in git)
+*.bak
+*.bak_*
+*.backup
