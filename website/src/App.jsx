@@ -15,8 +15,8 @@ function Header() {
     <header className="topbar">
       <div className="container topbar-inner">
         <a href="#top" className="brand" onClick={() => setOpen(false)}>
-          <span className="brand-mark">FB</span>
-          <span>Factory Bent<span className="brand-dim"> · BCR Arm</span></span>
+          <span className="brand-mark">FC</span>
+          <span>Factory Conveyor<span className="brand-dim"> · BCR Arm</span></span>
         </a>
         <button className="menu-btn" aria-label="Menu" aria-expanded={open} onClick={() => setOpen(!open)}>
           {open ? '✕' : '☰'}
@@ -41,11 +41,11 @@ function Hero() {
         <div className="hero-text">
           <p className="kicker">ROS 2 · Gazebo · OpenCV · Robotics</p>
           <h1>
-            Factory Bent Simulation <span className="accent">with a BCR Robot Arm</span>
+            Factory Conveyor Simulation <span className="accent">with a BCR Robot Arm</span>
           </h1>
           <p className="hero-lead">
             A 7-axis Black Coffee Robotics arm watches moving products through three cameras, picks each one off a
-            conveyor bent and places it on another bent, or drops it into a trash or recycling bin. Every decision
+            conveyor and places it on another conveyor, or drops it into a trash or recycling bin. Every decision
             comes from OpenCV.
           </p>
           <div className="hero-cta">
@@ -80,7 +80,7 @@ function Overview() {
       id="overview"
       kicker="01 · Overview"
       title="From a camera image to a robot moving a product"
-      lead="The project is a simulated factory cell. Products ride on conveyor belts (“bents”). Cameras look at them, OpenCV finds and classifies them, and a BCR arm picks them up and moves them where they belong. Around that core sit a product generator, an operator GUI, ten worlds and a lab for testing new detectors."
+      lead="The project is a simulated factory cell. Products ride on conveyor belts. Cameras look at them, OpenCV finds and classifies them, and a BCR arm picks them up and moves them where they belong. Around that core sit a product generator, an operator GUI, ten worlds and a lab for testing new detectors."
     >
       <div className="grid features reveal">
         {features.map((f) => (
@@ -92,14 +92,14 @@ function Overview() {
         ))}
       </div>
       <div className="split reveal">
-        <Figure name="screenshot_2026-10-31_dual_circular_factory.png" caption="The dual circular cell in Gazebo: two bents, the BCR arm in the middle, the trash bin and the operator desk" />
+        <Figure name="screenshot_2026-10-31_dual_circular_factory.png" caption="The dual circular cell in Gazebo: two conveyors, the BCR arm in the middle, the trash bin and the operator desk" />
         <div className="prose">
           <h3>Goals</h3>
           <ul className="ticks">
             <li>Detect products on a moving belt using classic OpenCV and, optionally, YOLO.</li>
             <li>Turn pixel detections into world coordinates the arm can reach.</li>
-            <li>Pick and place from one bent to another, closed-loop, while both belts move.</li>
-            <li>Generate products for the singular factory bent and every other world.</li>
+            <li>Pick and place from one conveyor to another, closed-loop, while both belts move.</li>
+            <li>Generate products for the single factory conveyor and every other world.</li>
             <li>Make it easy to swap in a new detection algorithm and measure it.</li>
           </ul>
           <p className="muted">
@@ -160,8 +160,8 @@ function Worlds() {
           <h3>{w.name}</h3>
           <p>{w.text}</p>
           <dl>
-            <dt>Bent 1</dt><dd>{w.bent1}</dd>
-            <dt>Bent 2</dt><dd>{w.bent2}</dd>
+            <dt>Conveyor 1</dt><dd>{w.bent1}</dd>
+            <dt>Conveyor 2</dt><dd>{w.bent2}</dd>
             <dt>Arm delivers to</dt><dd>{w.delivers}</dd>
           </dl>
           <Code>{w.cmd}</Code>
@@ -171,7 +171,7 @@ function Worlds() {
       <div className="table-wrap reveal">
         <table>
           <thead>
-            <tr><th>Launcher</th><th>Bent 1</th><th>Bent 2</th><th>The arm delivers to</th></tr>
+            <tr><th>Launcher</th><th>Conveyor 1</th><th>Conveyor 2</th><th>The arm delivers to</th></tr>
           </thead>
           <tbody>
             {worlds.map((x) => (
@@ -257,7 +257,7 @@ function Arm() {
     <Section
       id="arm"
       kicker="05 · Pick and place"
-      title="A closed-loop grasp on a moving belt"
+      title="Vision-timed pick and place from a moving belt"
       lead="The controller solves inverse kinematics from the robot’s own URDF, descends with feedback, and chooses how to carry each product from its measured height."
     >
       <div className="grid three reveal">
@@ -272,7 +272,7 @@ function Arm() {
           <h3>🤏 Precise grasp</h3>
           <p>
             Fast descent to 10 cm above the product, then slow. The grip happens only when forward kinematics puts the tip
-            within 1.5 cm of the top. The held product is pinned, so the gripper can’t push it away.
+            within 1.5 cm of the top. The product is held still during the descent, so the gripper can’t push it away.
           </p>
         </article>
         <article className="card">
@@ -282,6 +282,13 @@ function Arm() {
             drops the product, and its fall into the bin is simulated.
           </p>
         </article>
+      </div>
+
+      <div className="callout reveal">
+        <strong>Simulation notes.</strong> The gripper does not hold products through contact physics. Once the tip is within
+        1.5 cm, <code>bcr_endpoint_object_attacher</code> moves the product with the gripper through Gazebo{' '}
+        <code>set_pose</code> calls, a common shortcut in Gazebo pick-and-place work. The fall into a bin is scripted the same
+        way. The arm motion, IK, timing and all vision checks are real; physics-based grasping is a next step.
       </div>
 
       <h3 className="sub-head reveal">Six movement styles</h3>
@@ -311,7 +318,7 @@ function Products() {
       alt
       kicker="06 · Product generator"
       title="100 realistic products, plus your own"
-      lead="The object generator puts orders of products on any bent, including the singular straight bent. Each type has a detailed look but a simple collision shape, and its top keeps the catalogue colour so the detectors still recognise it."
+      lead="The object generator puts orders of products on any conveyor, including the single straight conveyor. Each type has a detailed look but a simple collision shape, and its top keeps the catalogue colour so the detectors still recognise it."
     >
       <Figure className="wide reveal" name="products_100_realistic.png" caption="The 100 built-in product types: 66 boxes, 26 cylinders and 8 spheres, with caps, lids, ribbons and fictional printed labels" />
 
@@ -326,7 +333,7 @@ function Products() {
         <div className="prose">
           <h3>The order GUI</h3>
           <p>
-            Pick products from a picture grid, set where each type goes (bent 2, trash or recycling), the spacing, belt speed,
+            Pick products from a picture grid, set where each type goes (conveyor 2, trash or recycling), the spacing, belt speed,
             simulation speed and run time, then press <em>Start simulation with this order</em>. After the world starts, the
             window comes back for live orders.
           </p>
@@ -359,6 +366,11 @@ function Pipeline() {
       title="Scaling one cell to 12 arms"
       lead="The pipeline factory has 4 sorting rings (C1–C4), 9 transport lines (S1–S9), 12 BCR arms (A1–A12) and 5 docks. Straight lines carry products between stations; on each ring, arms pick off the products that match their rule. The whole factory is generated from pipeline_layout.py."
     >
+      <p className="note reveal">
+        Unlike the single cell, the pipeline factory runs kinematically: <code>pipeline_sim.py</code> moves belts, products and
+        arms at 20 Hz over gz-transport, without ROS controllers, so all 12 arms fit on one PC. Driving it with ROS controllers
+        is on the roadmap.
+      </p>
       <div className="reveal"><PipelineDiagram /></div>
       <div className="grid two reveal">
         <Figure name="screenshot_2026-10-31_pipeline_factory_overview.png" caption="Pipeline factory overview in Gazebo" />
@@ -431,7 +443,8 @@ def main(lab):
         </table>
       </div>
       <div className="callout reveal">
-        <strong>7 of 7 cases passed</strong>, but the detector’s labels were right in 48 of 60 decisions (80 %). Most misses were{' '}
+        <strong>7 of 8 cases were run and all 7 passed</strong> (the <code>whole_factory_rules</code> stress test was not part
+        of this run, which used the <code>--fake</code> backend with drawn camera images, on Nov 1). The detector’s labels were right in 48 of 60 decisions (80 %). Most misses were{' '}
         <code>shoe_box</code> labelled as <code>cookie_tin</code>, two types with similar top colours. That is exactly the kind of
         finding the lab is built to surface, and a good first target for a trained YOLO model.
       </div>
@@ -447,7 +460,7 @@ function Timeline() {
       id="timeline"
       kicker="09 · Evolution"
       title="From one belt to a 12-arm factory"
-      lead="The project started in March 2026 as a single straight conveyor with an overhead camera. Between Oct 29 and Nov 1, 2026 it grew into the full system through about 27 phases, each traceable through a .bak_before_* backup."
+      lead="The project started in March 2026 as a single straight conveyor with an overhead camera. Between Oct 29 and Nov 1, 2026 it grew into the full system through about 27 phases, each documented in COMMANDS.md and the PDF reports."
     >
       <div className="eras reveal">
         {eras.map((x, k) => (
@@ -515,8 +528,8 @@ source ~/ros2_ws/install/setup.bash`}</Code>
           <h3>What happens</h3>
           <ol className="steps">
             <li>The <strong>Product Order</strong> window opens. Pick products, set “Goes to” and the spacing, then press <em>Start simulation with this order</em>.</li>
-            <li>Gazebo starts with both bents, the arm, the cameras, the attacher and the controller.</li>
-            <li>Products appear on bent 1 and the arm starts picking. After about 8 s the order window opens again for live orders.</li>
+            <li>Gazebo starts with both conveyors, the arm, the cameras, the attacher and the controller.</li>
+            <li>Products appear on conveyor 1 and the arm starts picking. After about 8 s the order window opens again for live orders.</li>
             <li>Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal to stop everything.</li>
           </ol>
           <h3>Variants</h3>

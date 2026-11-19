@@ -1,12 +1,12 @@
-# 🏭 Factory Bent Simulation with a BCR Robot Arm
+# 🏭 Factory Conveyor Simulation with a BCR Robot Arm
 
-Vision-guided pick and place on factory conveyor belts ("bents"), in **ROS 2 Jazzy**, **Gazebo Harmonic** and **OpenCV**.
+Vision-guided pick and place on factory conveyor belts, in **ROS 2 Jazzy**, **Gazebo Harmonic** and **OpenCV**.
 
 
 ![Dual circular factory with the BCR arm](docs/images/screenshot_2026-10-31_dual_circular_factory.png)
 
 A 7-axis Black Coffee Robotics (BCR) arm watches moving products through three cameras. It picks each product
-off one bent and places it on another bent, or drops it into a trash or recycling bin.
+off one conveyor and places it on another conveyor, or drops it into a trash or recycling bin.
 
 ## Features
 
@@ -15,7 +15,7 @@ off one bent and places it on another bent, or drops it into a trash or recyclin
 - **Sorting** into trash and recycling bins
 - **Product generator** with 100 realistic products and your own 3D models
 - **Order GUI** (PyQt5) for orders, belt speed and simulation speed
-- **Worlds** with circular and straight bents in every combination
+- **Worlds** with circular and straight conveyors in every combination
 - **Vision lab** for testing your own OpenCV or YOLO detectors
 
 ## Requirements
@@ -45,7 +45,7 @@ the cameras and the controller then start. Press **Ctrl+C** to stop.
 
 ## Worlds
 
-| Command | Bent 1 | Bent 2 |
+| Command | Conveyor 1 | Conveyor 2 |
 |---|---|---|
 | `./run_dual_circular.sh` | circular | circular |
 | `./run_single_circular.sh` | circular | none |

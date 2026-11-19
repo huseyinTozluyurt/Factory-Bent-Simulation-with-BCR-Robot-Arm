@@ -39,7 +39,7 @@ export const features = [
   {
     icon: '🦾',
     title: 'Closed-loop pick and place',
-    text: 'URDF-based inverse kinematics, catching moving products, pinning the product while the gripper descends, a precise grasp, and six movement styles.',
+    text: 'URDF-based inverse kinematics, catching moving products, holding the product still while the gripper descends, a simulated attach once the tip is within 1.5 cm, and six movement styles.',
   },
   {
     icon: '♻️',
@@ -49,7 +49,7 @@ export const features = [
   {
     icon: '📦',
     title: 'Product generator',
-    text: '100 realistic product types, your own .stl, .obj or .dae models, and orders spawned on any bent.',
+    text: '100 realistic product types, your own .stl, .obj or .dae models, and orders spawned on any conveyor.',
   },
   {
     icon: '🖥️',
@@ -59,7 +59,7 @@ export const features = [
   {
     icon: '🌍',
     title: '10 worlds',
-    text: 'Circular and straight bents in every combination, plus a factory with 13 conveyors and 12 arms.',
+    text: 'Circular and straight conveyors in every combination, plus a factory with 13 conveyors and 12 arms.',
   },
   {
     icon: '🧪',
@@ -84,7 +84,7 @@ export const nodes = [
   },
   {
     name: 'release_zone_monitor',
-    role: 'Compares each frame with a learned empty belt and reports whether the drop zone on bent 2 is empty.',
+    role: 'Compares each frame with a learned empty belt and reports whether the drop zone on conveyor 2 is empty.',
   },
   {
     name: 'vision_pick_place',
@@ -92,7 +92,7 @@ export const nodes = [
   },
   {
     name: 'bcr_endpoint_object_attacher',
-    role: 'Grasp and release, holding the product still, stopping and starting bents, spawning orders, and simulated falls into bins and boxes.',
+    role: 'Grasp and release, holding the product still, stopping and starting conveyors, spawning orders, and simulated falls into bins and boxes.',
   },
   {
     name: 'order_gui',
@@ -101,15 +101,15 @@ export const nodes = [
 ]
 
 export const cycle = [
-  { id: 'Home', text: 'The arm waits at its home pose while the overhead camera tracks products on bent 1 and predicts when one will reach the catch station at (-2.58, 0).' },
+  { id: 'Home', text: 'The arm waits at its home pose while the overhead camera tracks products on conveyor 1 and predicts when one will reach the catch station at (-2.58, 0).' },
   { id: 'Cross-check', text: 'A product reaches the station. The side camera must see a blob standing on the belt within 0.20 m of the overhead track. If the cameras disagree, the product simply rides on.' },
-  { id: 'Hold', text: 'Both cameras agree. Bent 1 stops and the product is pinned in place, so the descending gripper cannot push it.' },
+  { id: 'Hold', text: 'Both cameras agree. Conveyor 1 stops and the product is pinned in place, so the descending gripper cannot push it.' },
   { id: 'Descend', text: 'The arm drops quickly to 10 cm above the product top measured by the side camera, then slowly. Forward kinematics is checked every step.' },
-  { id: 'Attach', text: 'The grip happens only when FK puts the tip within 1.5 cm of the product top. The attacher snaps the top face to the gripper tip and bent 1 starts again.' },
+  { id: 'Attach', text: 'The grip happens only when FK puts the tip within 1.5 cm of the product top. The attacher snaps the top face to the gripper tip and conveyor 1 starts again.' },
   { id: 'Lift', text: 'The product is lifted 0.30 to 0.60 m, depending on the movement style chosen from its height.' },
-  { id: 'Swing', text: 'One smooth swing toward the destination: bent 2, the trash bin or the recycling bin.' },
-  { id: 'Wait zone', text: 'For bent 2, the release camera must report the drop zone EMPTY. Bent 2 is stopped during the release.' },
-  { id: 'Place / drop', text: 'The product is placed at (2.22, -0.37) on bent 2, or dropped from a high travel pose over the bin centre with a simulated free fall. Then the arm returns home.' },
+  { id: 'Swing', text: 'One smooth swing toward the destination: conveyor 2, the trash bin or the recycling bin.' },
+  { id: 'Wait zone', text: 'For conveyor 2, the release camera must report the drop zone EMPTY. Conveyor 2 is stopped during the release.' },
+  { id: 'Place / drop', text: 'The product is placed at (2.22, -0.37) on conveyor 2, or dropped from a high travel pose over the bin centre with a simulated free fall. Then the arm returns home.' },
 ]
 
 export const worlds = [
@@ -119,9 +119,9 @@ export const worlds = [
     cmd: './run_dual_circular.sh',
     bent1: 'circular',
     bent2: 'circular',
-    delivers: 'bent 2, trash, recycling',
+    delivers: 'conveyor 2, trash, recycling',
     image: 'screenshot_2026-10-31_dual_circular_factory.png',
-    text: 'The main cell: two circular bents with the BCR arm between them, a trash bin, a recycling bin, and factory decor (hall, fences, stack lights, racks, a control desk).',
+    text: 'The main cell: two circular conveyors with the BCR arm between them, a trash bin, a recycling bin, and factory decor (hall, fences, stack lights, racks, a control desk).',
   },
   {
     key: 'straight-circular',
@@ -129,9 +129,9 @@ export const worlds = [
     cmd: './run_exp_straight_to_circular.sh',
     bent1: 'straight',
     bent2: 'circular',
-    delivers: 'bent 2, trash, recycling',
+    delivers: 'conveyor 2, trash, recycling',
     image: 'exp_straight_to_circular.png',
-    text: 'Products arrive on a straight conveyor and are placed onto a circular bent.',
+    text: 'Products arrive on a straight conveyor and are placed onto a circular conveyor.',
   },
   {
     key: 'circular-straight',
@@ -139,9 +139,9 @@ export const worlds = [
     cmd: './run_exp_circular_to_straight.sh',
     bent1: 'circular',
     bent2: 'straight',
-    delivers: 'bent 2, trash, recycling',
+    delivers: 'conveyor 2, trash, recycling',
     image: 'exp_circular_to_straight.png',
-    text: 'The arm picks from a circular bent and places onto a straight outbound conveyor.',
+    text: 'The arm picks from a circular conveyor and places onto a straight outbound conveyor.',
   },
   {
     key: 'straight-straight',
@@ -149,7 +149,7 @@ export const worlds = [
     cmd: './run_exp_straight_to_straight.sh',
     bent1: 'straight',
     bent2: 'straight',
-    delivers: 'bent 2, trash, recycling',
+    delivers: 'conveyor 2, trash, recycling',
     image: 'exp_straight_to_straight.png',
     text: 'Two straight conveyors: a classic line-to-line transfer cell.',
   },
@@ -161,7 +161,7 @@ export const worlds = [
     bent2: 'none',
     delivers: 'trash and recycling (the rest fall into a collection box)',
     image: 'screenshot_2026-10-31_order_gui_straight_detection.png',
-    text: 'The singular factory bent with the object generator. Products that the arm leaves on the belt fall into a collection box at its end. This world was tested on the real PC on Nov 1.',
+    text: 'The single factory conveyor with the object generator. Products that the arm leaves on the belt fall into a collection box at its end. This world was tested on the real PC on Nov 1.',
   },
   {
     key: 'single-circular',
@@ -171,7 +171,7 @@ export const worlds = [
     bent2: 'none',
     delivers: 'trash and recycling (the rest stay on the belt)',
     image: null,
-    text: 'One circular bent. The arm sorts products into the bins and the rest keep circling.',
+    text: 'One circular conveyor. The arm sorts products into the bins and the rest keep circling.',
   },
 ]
 
@@ -192,7 +192,7 @@ export const cameras = [
   },
   {
     name: 'Release',
-    where: 'above the drop zone on bent 2',
+    where: 'above the drop zone on conveyor 2',
     steps: ['difference from learned empty belt', 'threshold', 'contours in the zone'],
     question: 'Is the drop zone free?',
     image: 'release_zone_camera.png',
@@ -207,8 +207,8 @@ export const motionStyles = [
 ]
 
 export const labs = [
-  ['01', 'Detection survey', 'Detection only: counts per bent and label, snapshots'],
-  ['02', 'Bent → bent', 'Bent 1 to bent 2 (recycling in worlds without a bent 2)'],
+  ['01', 'Detection survey', 'Detection only: counts per conveyor and label, snapshots'],
+  ['02', 'Conveyor → conveyor', 'Conveyor 1 to conveyor 2 (recycling in worlds without a conveyor 2)'],
   ['03', 'Trash and recycle', 'Products into both bins'],
   ['04', 'Sort by label', 'A decide(ctx) rule on the detector’s label'],
   ['05', 'My OpenCV detector', 'Your own detector class inside the lab file'],
@@ -253,7 +253,7 @@ export const eras = [
     n: 2,
     title: 'Closing the loop',
     when: 'Oct 29',
-    text: 'In one evening the project went from detection only to a camera-driven arm: first picking still objects, then catching moving products, then cross-checking with a second camera and stopping the bent while grasping.',
+    text: 'In one evening the project went from detection only to a camera-driven arm: first picking still objects, then catching moving products, then cross-checking with a second camera and stopping the conveyor while grasping.',
     images: [
       ['side_camera_detections.png', 'Side camera cross-check'],
       ['overhead_detections.png', 'Overhead detections in world coordinates'],
@@ -273,7 +273,7 @@ export const eras = [
     n: 4,
     title: 'Generalisation',
     when: 'Oct 31 night',
-    text: 'The cell was rebuilt so that any bent shape works: six cell worlds from one layout table, and then a whole factory of 12 cells.',
+    text: 'The cell was rebuilt so that any conveyor shape works: six cell worlds from one layout table, and then a whole factory of 12 cells.',
     images: [
       ['exp_straight_to_circular.png', 'Straight → circular'],
       ['pipeline_top.png', 'The pipeline factory layout'],
@@ -300,19 +300,19 @@ export const phases = [
   ['Oct 29 21:34', 'Catch station', 'Catching moving products. A ROI tracker predicts when a product enters the station circle, accounting for catch latency.'],
   ['Oct 29 22:32', 'Side camera', 'A second camera at belt height must confirm the product; it is then held and the arm descends onto its measured top.'],
   ['Oct 29 22:51', 'Carry', 'Lift after the grab, capped at the arm’s reach, then one swing to ring 2 with a short settle before release.'],
-  ['Oct 29 23:24', 'Bent stop', 'Bent 1 stops while the product is held and restarts once the arm has it. Exact place slots on ring 2.'],
-  ['Oct 30 00:11', 'Moving ring 2', 'Bent 2 moves too. The release-zone camera waits for an empty zone; bent 2 stops during release.'],
+  ['Oct 29 23:24', 'Conveyor stop', 'Conveyor 1 stops while the product is held and restarts once the arm has it. Exact place slots on ring 2.'],
+  ['Oct 30 00:11', 'Moving ring 2', 'Conveyor 2 moves too. The release-zone camera waits for an empty zone; conveyor 2 stops during release.'],
   ['Oct 30 01:03', 'Home & styles', 'The arm waits at home. Six movement styles chosen by the object’s height.'],
   ['Oct 30 01:42', 'Order GUI', 'Product Order window (PyQt5) and the /spawn_order topic with 16 product types.'],
   ['Oct 30 14:36', 'Pictures', '30 product types including spheres, and a photo camera that renders a picture grid for the GUI.'],
   ['Oct 30 21:36', 'One command', 'run_factory.sh: the order window first, then one launch file starts everything. A .desktop launcher.'],
-  ['Oct 30 21:50', 'Speed', 'Bent 2 orders, one belt speed for both bents, simulation speed and a run-time limit.'],
+  ['Oct 30 21:50', 'Speed', 'Conveyor 2 orders, one belt speed for both conveyors, simulation speed and a run-time limit.'],
   ['Oct 30 22:27', 'Style & decor', 'A dark factory theme for the GUI and world decor: hall, fence, stack lights, racks, desk, signs.'],
   ['Oct 30 23:45', 'Close grasp', 'Two-step descent; grip only when FK says the tip is within 1.5 cm of the contact point.'],
   ['Oct 30 23:57', 'Bins', 'Trash and recycling bins with collisions, a “Goes to” choice per product, and auto-sort by material.'],
   ['Oct 31 00:08', 'Bin drop', 'Pinned product during descent, high travel over the bin centre, bin-wall-safe IK and a simulated free fall.'],
   ['Oct 31 01:46', 'Worlds', 'Single circular and straight worlds rebuilt around the same cell; WORLD_LAYOUTS tells every node the belt geometry.'],
-  ['Oct 31 03:34', 'Mixed worlds', 'Free fall into the collection box. Three experimental worlds that mix straight and circular bents.'],
+  ['Oct 31 03:34', 'Mixed worlds', 'Free fall into the collection box. Three experimental worlds that mix straight and circular conveyors.'],
   ['Oct 31 04:21', 'Pipeline factory', '4 sorting rings, 9 lines, 12 arms, 5 docks, generated from pipeline_layout.py.'],
   ['Oct 31 17:32', 'Hang fix', 'Products no longer hang in the air past the belt end; the attacher reads the pose stream and logs errors.'],
   ['Oct 31 18:00', 'Vision lab', 'OpenCV/YOLO detectors plugged into the controller in every world, main(lab) scripts and offline scoring.'],
@@ -331,7 +331,7 @@ export const reports = [
 ]
 
 export const roadmap = [
-  [true, 'Vision-driven pick and place between two bents'],
+  [true, 'Vision-driven pick and place between two conveyors'],
   [true, 'Side-camera and release-camera checks'],
   [true, 'Trash and recycling bins, and sorting by material'],
   [true, 'Six single-cell worlds and the 12-arm pipeline factory'],

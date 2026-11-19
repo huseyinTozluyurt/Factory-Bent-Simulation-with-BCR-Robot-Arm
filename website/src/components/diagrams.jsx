@@ -68,7 +68,7 @@ export function ArchitectureDiagram() {
 
         <Box x={30} y={150} w={160} h={56} title="Overhead camera" sub="13 m, top-down" kind="gz" />
         <Box x={30} y={250} w={160} h={56} title="Side camera" sub="belt height" kind="gz" />
-        <Box x={30} y={350} w={160} h={56} title="Release camera" sub="above bent 2" kind="gz" />
+        <Box x={30} y={350} w={160} h={56} title="Release camera" sub="above conveyor 2" kind="gz" />
 
         <Box x={330} y={150} w={200} h={56} title="ring_object_detector" sub="contours · minAreaRect" />
         <Box x={330} y={250} w={200} h={56} title="side_camera_checker" sub="MOG2 · Canny · height" />
@@ -77,9 +77,9 @@ export function ArchitectureDiagram() {
         <Box x={700} y={215} w={200} h={126} title="vision_pick_place" sub="state machine + URDF IK" kind="core" />
 
         <Box x={962} y={150} w={220} h={56} title="BCR 7-axis arm" sub="joint trajectory controller" kind="gz" />
-        <Box x={962} y={350} w={220} h={56} title="bcr_endpoint_object_attacher" sub="grasp · bents · spawning" />
+        <Box x={962} y={350} w={220} h={56} title="bcr_endpoint_object_attacher" sub="grasp · conveyors · spawning" />
 
-        <Box x={330} y={480} w={850} h={56} title="Gazebo world: bents, products, bins" sub="moved through gz-transport set_pose / create" kind="gz" />
+        <Box x={330} y={480} w={850} h={56} title="Gazebo world: conveyors, products, bins" sub="moved through gz-transport set_pose / create" kind="gz" />
 
         <Edge d="M190,178 H322" label="ros_gz_bridge" lx={258} ly={170} />
         <Edge d="M190,278 H322" label="ros_gz_bridge" lx={258} ly={270} />
